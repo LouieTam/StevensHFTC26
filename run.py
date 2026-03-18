@@ -98,7 +98,7 @@ def market_maker_strategy(trader: shift.Trader, ticker: str, end_time):
 def main(trader):
     ticker = "GS"
     start_time = datetime.now()
-    end_time = start_time + timedelta(seconds=120)
+    end_time = start_time + timedelta(seconds=22000)
 
     market_maker_strategy(trader, ticker, end_time)
 
