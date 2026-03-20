@@ -1,6 +1,6 @@
 import shift
 from time import sleep
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 def cancel_orders(trader, ticker):
     for order in trader.get_waiting_list():
@@ -27,10 +27,9 @@ def market_maker_strategy(trader: shift.Trader, ticker: str, end_time):
     initial_pl = trader.get_portfolio_item(ticker).get_realized_pl()
     
     order_size = 1
-    wait_time = 3
     price_improvement = 0.01
 
-    while trader.get_last_trade_time() < end_time:
+    while datetime.now() < end_time:
         cancel_orders(trader, ticker)
 
         item = trader.get_portfolio_item(ticker)
@@ -41,31 +40,35 @@ def market_maker_strategy(trader: shift.Trader, ticker: str, end_time):
         best_bid = best_price.get_bid_price()
         best_ask = best_price.get_ask_price()
 
-        if best_bid > 0 and best_ask > 0 and ((best_ask - best_bid) >0.05):
+        current_wait = 3
+
+        if best_bid > 0 and best_ask > 0:
             my_bid_price = best_bid + price_improvement
             my_ask_price = best_ask - price_improvement
 
             if my_bid_price < my_ask_price:
                 if long_lots > 0:
+                    current_wait = 1
                     sell_order = shift.Order(shift.Order.Type.LIMIT_SELL, ticker, long_lots, my_ask_price)
                     trader.submit_order(sell_order)
-                    print(f"[{trader.get_last_trade_time()}] Inventory LONG. Quoting ASK {long_lots} @ {my_ask_price:.2f}", flush=True)
+                    print(f"[{datetime.now()}] Inventory LONG. Quoting ASK {long_lots} @ {my_ask_price:.2f}", flush=True)
                 
                 elif short_lots > 0:
+                    current_wait = 1
                     buy_order = shift.Order(shift.Order.Type.LIMIT_BUY, ticker, short_lots, my_bid_price)
                     trader.submit_order(buy_order)
-                    print(f"[{trader.get_last_trade_time()}] Inventory SHORT. Quoting BID {short_lots} @ {my_bid_price:.2f}", flush=True)
+                    print(f"[{datetime.now()}] Inventory SHORT. Quoting BID {short_lots} @ {my_bid_price:.2f}", flush=True)
                 
-                else:
+                elif (best_ask - best_bid) > 0.05:
                     buy_order = shift.Order(shift.Order.Type.LIMIT_BUY, ticker, order_size, my_bid_price)
                     trader.submit_order(buy_order)
                     
                     sell_order = shift.Order(shift.Order.Type.LIMIT_SELL, ticker, order_size, my_ask_price)
                     trader.submit_order(sell_order)
                     
-                    print(f"[{trader.get_last_trade_time()}] Inventory FLAT. Quoting BID {order_size} @ {my_bid_price:.2f} | ASK {order_size} @ {my_ask_price:.2f}", flush=True)
+                    print(f"[{datetime.now()}] Inventory FLAT. Quoting BID {order_size} @ {my_bid_price:.2f} | ASK {order_size} @ {my_ask_price:.2f}", flush=True)
 
-        sleep(wait_time)
+        sleep(current_wait)
 
     cancel_orders(trader, ticker)
     close_positions(trader, ticker)
@@ -75,13 +78,8 @@ def market_maker_strategy(trader: shift.Trader, ticker: str, end_time):
 
 def main(trader):
     ticker = "GS"
-    current = trader.get_last_trade_time()
-    start_time = current
-    
+    start_time = datetime.now()
     end_time = start_time + timedelta(seconds=180)
-
-    while trader.get_last_trade_time() < start_time:
-        sleep(1)
 
     market_maker_strategy(trader, ticker, end_time)
 
