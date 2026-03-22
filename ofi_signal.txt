@@ -1,0 +1,2 @@
+[[33;1;1mERROR[0m] Connection Timeout Error
+[[33;1;1mERROR[0m] No connection established.
