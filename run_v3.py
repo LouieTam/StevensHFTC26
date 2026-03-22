@@ -118,7 +118,7 @@ def market_maker_strategy(trader: shift.Trader, ticker: str, end_time):
     print(f"Total realized profits/losses for {ticker}: {final_pl:.2f}", flush=True)
 
 def main(trader):
-    ticker = "AAPL"
+    ticker = "SHW"
     start_time = datetime.now()
     end_time = start_time + timedelta(seconds=22000)
 
