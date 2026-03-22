@@ -3,8 +3,8 @@ import time
 import csv
 
 def record_market_data(trader, ticker):
-    with open('trades.csv', mode='w', newline='') as trades_file, \
-         open('order_book.csv', mode='w', newline='') as ob_file:
+    with open('trades2.csv', mode='w', newline='') as trades_file, \
+         open('order_book2.csv', mode='w', newline='') as ob_file:
         
         trades_writer = csv.writer(trades_file)
         ob_writer = csv.writer(ob_file)
@@ -30,12 +30,12 @@ def record_market_data(trader, ticker):
                     trades_writer.writerow([current_trade_time, f"{price:.4f}", size])
                 last_trade_time = current_trade_time
             
-            current_time = time.time()
-            if current_time - last_ob_time >= 1.0000:
+            #current_time = time.time()
+            #if current_time - last_ob_time >= 1.0000:
                 bids = trader.get_order_book(ticker, shift.OrderBookType.GLOBAL_BID)
                 asks = trader.get_order_book(ticker, shift.OrderBookType.GLOBAL_ASK)
                 
-                row = [current_time]
+                row = [current_trade_time]
                 
                 for i in range(10):
                     if i < len(bids):
@@ -50,7 +50,7 @@ def record_market_data(trader, ticker):
                         row.extend(["0.0000", 0])
                         
                 ob_writer.writerow(row)
-                last_ob_time = current_time
+                #last_ob_time = current_time
                 
             time.sleep(0.0100)
 
