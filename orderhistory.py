@@ -3,8 +3,8 @@ import time
 import csv
 
 def record_market_data(trader, ticker):
-    with open('trades2.csv', mode='w', newline='') as trades_file, \
-         open('order_book2.csv', mode='w', newline='') as ob_file:
+    with open('trades_nov02.csv', mode='w', newline='') as trades_file, \
+         open('order_book_nov02.csv', mode='w', newline='') as ob_file:
         
         trades_writer = csv.writer(trades_file)
         ob_writer = csv.writer(ob_file)
