@@ -199,7 +199,8 @@ def run_mlofi_pressure_signal(trader, symbol=SYMBOL, levels=LEVELS,
 
         step += 1
 
-        print(f"\n--- Signal @ {datetime.now()} | step {step} ---")
+        current_trade_time = trader.get_last_trade_time()
+        print(f"\n--- Signal @ {current_trade_time} | step {step} ---")
         print(f"Best Bid:          {best_bid_p:.4f} x {best_bid_q:.4f}")
         print(f"Best Ask:          {best_ask_p:.4f} x {best_ask_q:.4f}")
         print(f"Mid:               {mid:.4f}")
@@ -236,7 +237,7 @@ if __name__ == "__main__":
         trader.sub_all_order_book()
         time.sleep(1)
 
-        end_time = datetime.now() + timedelta(minutes=10)
+        end_time = datetime.now() + timedelta(minutes=500)
 
         try:
             run_mlofi_pressure_signal(
