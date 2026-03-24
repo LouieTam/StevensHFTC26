@@ -99,11 +99,11 @@ def ensure_csv_headers():
                 "exec_timestamp",
             ])
 
-def append_submission_log(order_id, symbol, side, limit_price, shares, regime, signal, step, position_shares):
+def append_submission_log(sim_time, order_id, symbol, side, limit_price, shares, regime, signal, step, position_shares):
     with open(SUBMISSION_LOG_PATH, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now(),
+            sim_time,
             order_id,
             symbol,
             side,
@@ -116,11 +116,11 @@ def append_submission_log(order_id, symbol, side, limit_price, shares, regime, s
             int(position_shares),
         ])
 
-def append_execution_log(order_id, symbol, side, executed_price, executed_size, order_size, status, exec_timestamp):
+def append_execution_log(sim_time, order_id, symbol, side, executed_price, executed_size, order_size, status, exec_timestamp):
     with open(EXECUTION_LOG_PATH, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now(),
+            sim_time,
             order_id,
             symbol,
             side,
@@ -369,6 +369,7 @@ def submit_quote_and_track(trader, symbol, side, lots, price, tracked_orders, si
     trader.submit_order(order)
 
     now_dt = datetime.now()
+    sim_time = trader.get_last_trade_time()
 
     tracked_orders[order.id] = {
         "symbol": symbol,
@@ -383,20 +384,22 @@ def submit_quote_and_track(trader, symbol, side, lots, price, tracked_orders, si
     }
 
     append_submission_log(
-        order_id=order.id,
-        symbol=symbol,
-        side=side,
-        limit_price=price,
-        shares=lots * LOT_SIZE,
-        regime=regime,
-        signal=signal,
-        step=step,
-        position_shares=position_shares,
+        sim_time,
+        order.id,
+        symbol,
+        side,
+        price,
+        lots * LOT_SIZE,
+        regime,
+        signal,
+        step,
+        position_shares,
     )
 
     return order, now_dt
 
 def poll_executions(trader, tracked_orders, seen_execution_keys):
+    sim_time = trader.get_last_trade_time()
     for order_id, meta in list(tracked_orders.items()):
         try:
             executed_orders = trader.get_executed_orders(order_id)
@@ -418,14 +421,15 @@ def poll_executions(trader, tracked_orders, seen_execution_keys):
                         seen_execution_keys.add(exec_key)
 
                         append_execution_log(
-                            order_id=order_id,
-                            symbol=getattr(ex, "symbol", meta["symbol"]),
-                            side=meta["side"],
-                            executed_price=executed_price,
-                            executed_size=executed_size,
-                            order_size=meta["lots"] * LOT_SIZE,
-                            status=str(getattr(ex, "status", "")),
-                            exec_timestamp=getattr(ex, "timestamp", ""),
+                            sim_time,
+                            order_id,
+                            getattr(ex, "symbol", meta["symbol"]),
+                            meta["side"],
+                            executed_price,
+                            executed_size,
+                            meta["lots"] * LOT_SIZE,
+                            str(getattr(ex, "status", "")),
+                            getattr(ex, "timestamp", ""),
                         )
 
                         print(
@@ -784,6 +788,7 @@ def run_mlofi_market_maker(trader, symbol=SYMBOL, levels=LEVELS,
         expiry_str = regime_expiry.strftime("%H:%M:%S") if regime_expiry is not None else "None"
         post_fill_str = post_fill_until.strftime("%H:%M:%S") if post_fill_until is not None else "None"
 
+        sim_time_now = trader.get_last_trade_time()
         print(f"\n--- MM Loop @ {now_dt} | step {step} ---")
         print(f"Best Bid:          {best_bid_p:.4f} x {best_bid_q:.4f}")
         print(f"Best Ask:          {best_ask_p:.4f} x {best_ask_q:.4f}")
@@ -805,6 +810,7 @@ def run_mlofi_market_maker(trader, symbol=SYMBOL, levels=LEVELS,
         print(f"Live bid:          {live_bid_price} / age {live_bid_age}")
         print(f"Live ask:          {live_ask_price} / age {live_ask_age}")
         print(f"Tracked order ids: {len(tracked_orders)}")
+        print(f"Sim time now: {sim_time_now}")
         
         bp = trader.get_portfolio_summary().get_total_bp()
         print(f"Available Buying Power: {bp:.4f}")
