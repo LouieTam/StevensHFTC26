@@ -6,9 +6,7 @@ import os
 from collections import deque
 from datetime import datetime, timedelta
 
-# Directional trade (WORKS OK)
-
-SYMBOL = "AAPL"
+SYMBOL = "IBM"
 LEVELS = 10
 POLL_INTERVAL = 1.0000
 OFI_WINDOW_SECONDS = 5.0000
@@ -22,24 +20,23 @@ FINAL_SCORE_THRESHOLD = 0.5000
 
 OFI_FLOOR = 100.0000
 EMA_ENTRY_THRESHOLD = 200.0000
+# Lower bar for flips — already holding an opposing position is itself
+# confirmation, so we don't need the signal to be as strong as a fresh entry.
+EMA_FLIP_THRESHOLD  = 150.0000
 
 TICK_SIZE = 0.0100
 LOT_SIZE = 100
 TRADE_LOTS = 2
 
 ENTRY_SPREAD_FRAC = 0.00
-EXIT_SPREAD_FRAC = 0.000
+EXIT_SPREAD_FRAC  = 0.000
 
-HOLD_SECONDS = 5.0000
+HOLD_SECONDS = 7.0000
 EXIT_ADJUST_SECONDS = 2.0000
-EXEC_AUDIT_INTERVAL_SECONDS = 30.0000   # FIX: was 300s
+EXEC_AUDIT_INTERVAL_SECONDS = 30.0000
 
 SUBMISSION_LOG_PATH = "dir_order_submissions_nov02.csv"
-EXECUTION_LOG_PATH = "dir_order_executions_nov02.csv"
-
-# ---------------------------------------------------------------------------
-# Tick helpers
-# ---------------------------------------------------------------------------
+EXECUTION_LOG_PATH  = "dir_order_executions_nov02.csv"
 
 def round_down_to_tick(x, tick=TICK_SIZE):
     return math.floor(round(x / tick, 6)) * tick
@@ -51,52 +48,33 @@ def lots_to_shares(lots):
     return int(lots * LOT_SIZE)
 
 def sanitise_price(price):
-    # Round to 2dp to eliminate floating-point residue from tick arithmetic
-    # e.g. 190.63000000000001 -> 190.63
     return round(float(price), 2)
-
-# ---------------------------------------------------------------------------
-# CSV logging
-# ---------------------------------------------------------------------------
 
 def ensure_csv_headers():
     if not os.path.exists(SUBMISSION_LOG_PATH):
         with open(SUBMISSION_LOG_PATH, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "logged_at", "order_id", "symbol", "side", "limit_price",
-                "shares", "lots", "regime", "signal", "step", "position_shares_before_submit"
-            ])
-
+            writer.writerow(["logged_at","order_id","symbol","side","limit_price",
+                             "shares","lots","regime","signal","step","position_shares_before_submit"])
     if not os.path.exists(EXECUTION_LOG_PATH):
         with open(EXECUTION_LOG_PATH, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "logged_at", "order_id", "symbol", "side", "executed_price",
-                "executed_size", "order_size", "status", "exec_timestamp"
-            ])
+            writer.writerow(["logged_at","order_id","symbol","side","executed_price",
+                             "executed_size","order_size","status","exec_timestamp"])
 
 def append_submission_log(sim_time, order_id, symbol, side, limit_price,
                           shares, regime, signal, step, position_shares):
     with open(SUBMISSION_LOG_PATH, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            sim_time, order_id, symbol, side, f"{float(limit_price):.4f}",
-            int(shares), int(shares // LOT_SIZE), regime, signal, step, int(position_shares)
-        ])
+        writer.writerow([sim_time, order_id, symbol, side, f"{float(limit_price):.4f}",
+                         int(shares), int(shares // LOT_SIZE), regime, signal, step, int(position_shares)])
 
 def append_execution_log(sim_time, order_id, symbol, side, executed_price,
                          executed_size, order_size, status, exec_timestamp):
     with open(EXECUTION_LOG_PATH, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            sim_time, order_id, symbol, side, f"{float(executed_price):.4f}",
-            int(executed_size), int(order_size), str(status), exec_timestamp
-        ])
-
-# ---------------------------------------------------------------------------
-# Execution audit
-# ---------------------------------------------------------------------------
+        writer.writerow([sim_time, order_id, symbol, side, f"{float(executed_price):.4f}",
+                         int(executed_size), int(order_size), str(status), exec_timestamp])
 
 def poll_executions(trader, tracked_orders, seen_execution_keys):
     sim_time = trader.get_last_trade_time()
@@ -107,43 +85,27 @@ def poll_executions(trader, tracked_orders, seen_execution_keys):
                 executed_size  = int(getattr(ex,  "executed_size",  0))
                 executed_price = float(getattr(ex, "executed_price", 0.0))
                 if executed_size > 0:
-                    exec_key = (
-                        order_id,
-                        str(getattr(ex, "timestamp", "")),
-                        executed_size,
-                        executed_price,
-                        str(getattr(ex, "status",    "")),
-                    )
+                    exec_key = (order_id, str(getattr(ex,"timestamp","")),
+                                executed_size, executed_price, str(getattr(ex,"status","")))
                     if exec_key not in seen_execution_keys:
                         seen_execution_keys.add(exec_key)
-                        append_execution_log(
-                            sim_time, order_id,
-                            getattr(ex, "symbol", meta["symbol"]),
-                            meta["side"], executed_price, executed_size,
-                            meta["lots"] * LOT_SIZE,
-                            str(getattr(ex, "status",    "")),
-                            getattr(ex,     "timestamp", ""),
-                        )
-
+                        append_execution_log(sim_time, order_id,
+                            getattr(ex,"symbol",meta["symbol"]), meta["side"],
+                            executed_price, executed_size, meta["lots"]*LOT_SIZE,
+                            str(getattr(ex,"status","")), getattr(ex,"timestamp",""))
             current_order = trader.get_order(order_id)
             if current_order is not None:
                 status_str     = str(getattr(current_order, "status",       ""))
                 total_executed = int(getattr(current_order, "executed_size", 0))
                 original_size  = meta["lots"] * LOT_SIZE
                 if ("FILLED" in status_str or "CANCELED" in status_str
-                        or "REJECTED" in status_str
-                        or total_executed >= original_size):
+                        or "REJECTED" in status_str or total_executed >= original_size):
                     tracked_orders[order_id]["done"] = True
         except Exception:
             pass
-
     to_delete = [oid for oid, meta in tracked_orders.items() if meta.get("done")]
     for oid in to_delete:
         del tracked_orders[oid]
-
-# ---------------------------------------------------------------------------
-# Order book parsing
-# ---------------------------------------------------------------------------
 
 def parse_shift_book(trader, symbol, levels):
     bids_obj = trader.get_order_book(symbol, shift.OrderBookType.GLOBAL_BID)
@@ -151,10 +113,6 @@ def parse_shift_book(trader, symbol, levels):
     bids = [(float(b.price), float(b.size)) for b in bids_obj[:levels]]
     asks = [(float(a.price), float(a.size)) for a in asks_obj[:levels]]
     return bids, asks
-
-# ---------------------------------------------------------------------------
-# OFI computation
-# ---------------------------------------------------------------------------
 
 def ema_update(prev_ema, new_value, alpha):
     if prev_ema is None:
@@ -168,15 +126,11 @@ def pad_book_side(levels_list, target_levels):
     return padded
 
 def compute_level_ofi(prev_bid_p, prev_bid_q, prev_ask_p, prev_ask_q,
-                      new_bid_p,  new_bid_q,  new_ask_p,  new_ask_q):
-    bid_term = (
-        (new_bid_q  if new_bid_p >= prev_bid_p else 0.0)
-        - (prev_bid_q if new_bid_p <= prev_bid_p else 0.0)
-    )
-    ask_term = (
-        -(new_ask_q  if new_ask_p <= prev_ask_p else 0.0)
-        + (prev_ask_q if new_ask_p >= prev_ask_p else 0.0)
-    )
+                      new_bid_p, new_bid_q, new_ask_p, new_ask_q):
+    bid_term = ((new_bid_q if new_bid_p >= prev_bid_p else 0.0)
+                - (prev_bid_q if new_bid_p <= prev_bid_p else 0.0))
+    ask_term = (-(new_ask_q if new_ask_p <= prev_ask_p else 0.0)
+                + (prev_ask_q if new_ask_p >= prev_ask_p else 0.0))
     return float(bid_term + ask_term)
 
 def compute_multilevel_ofi_increment(prev_bids, prev_asks, new_bids, new_asks, levels):
@@ -188,8 +142,7 @@ def compute_multilevel_ofi_increment(prev_bids, prev_asks, new_bids, new_asks, l
     for m in range(levels):
         e_m = compute_level_ofi(
             prev_bids[m][0], prev_bids[m][1], prev_asks[m][0], prev_asks[m][1],
-            new_bids[m][0],  new_bids[m][1],  new_asks[m][0],  new_asks[m][1],
-        )
+            new_bids[m][0],  new_bids[m][1],  new_asks[m][0],  new_asks[m][1])
         level_increments.append(e_m)
     return level_increments
 
@@ -208,15 +161,9 @@ def rolling_level_ofi(ofi_events, levels):
 def weighted_raw_ofi(level_ofi, weights):
     return float(sum(w * x for w, x in zip(weights, level_ofi)))
 
-# ---------------------------------------------------------------------------
-# Signal logic
-# ---------------------------------------------------------------------------
-
 def ema_direction(ema_value, ofi_floor):
-    if ema_value > ofi_floor:
-        return 1
-    if ema_value < -ofi_floor:
-        return -1
+    if ema_value > ofi_floor:  return 1
+    if ema_value < -ofi_floor: return -1
     return 0
 
 def persistence_stats(raw_ofi_history):
@@ -234,29 +181,15 @@ def classify_signal(ema_dir, pos_count, neg_count, persistence_score,
         final_score = 0.7 * (-1.0) + 0.3 * persistence_score
     else:
         final_score = 0.3 * persistence_score
-
-    if final_score > final_score_threshold:
-        return "BUY_PRESSURE"
-    if final_score < -final_score_threshold:
-        return "SELL_PRESSURE"
+    if final_score > final_score_threshold:  return "BUY_PRESSURE"
+    if final_score < -final_score_threshold: return "SELL_PRESSURE"
     return "NEUTRAL"
-
-# ---------------------------------------------------------------------------
-# Position helpers
-# ---------------------------------------------------------------------------
 
 def get_position_shares(trader, symbol):
     item = trader.get_portfolio_item(symbol)
     return int(item.get_long_shares()) - int(item.get_short_shares())
 
-# ---------------------------------------------------------------------------
-# Order helpers
-# ---------------------------------------------------------------------------
-
 def cancel_all_open_orders(trader, symbol):
-    """
-    FIX: filter by symbol so we don't cancel orders for other strategies.
-    """
     for order in trader.get_waiting_list():
         if order.symbol == symbol:
             try:
@@ -282,43 +215,27 @@ def submit_and_track_order(trader, symbol, side, lots, price, state, signal,
         order = shift.Order(shift.Order.Type.LIMIT_BUY,  symbol, int(lots), float(price))
     else:
         order = shift.Order(shift.Order.Type.LIMIT_SELL, symbol, int(lots), float(price))
-
     trader.submit_order(order)
     now_dt   = datetime.now()
     sim_time = trader.get_last_trade_time()
-
     tracked_orders[order.id] = {
-        "symbol":      symbol,
-        "side":        side,
-        "submit_time": now_dt,
-        "limit_price": float(price),
-        "lots":        int(lots),
-        "signal":      signal,
-        "regime":      state,
-        "step":        step,
-        "done":        False,
+        "symbol": symbol, "side": side, "submit_time": now_dt,
+        "limit_price": float(price), "lots": int(lots),
+        "signal": signal, "regime": state, "step": step, "done": False,
     }
-
     pos_shares = get_position_shares(trader, symbol)
     append_submission_log(sim_time, order.id, symbol, side, price,
                           lots * LOT_SIZE, state, signal, step, pos_shares)
     return order.id
 
-# ---------------------------------------------------------------------------
-# Main strategy loop
-# ---------------------------------------------------------------------------
-
 def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                              poll_interval=POLL_INTERVAL, end_time=None):
     ensure_csv_headers()
 
-    prev_bids = None
-    prev_asks = None
+    prev_bids       = None
+    prev_asks       = None
     ofi_events      = deque()
     raw_ofi_history = deque(maxlen=PERSISTENCE_LOOKBACK)
-
-    # FIX: widen recent_signals window — 2 ticks is too noise-sensitive for
-    # the hold-extension decision; use the last 5 ticks instead.
     recent_signals  = deque(maxlen=3)
     ema_t           = None
 
@@ -328,15 +245,16 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
 
     state                = "FLAT"
     entry_side           = None
-    entry_lots           = TRADE_LOTS  # may be larger on a flip (exit + new position)
-    entry_pos_snapshot   = 0           # position at the moment the entry order was submitted
+    entry_lots           = TRADE_LOTS
+    entry_pos_snapshot   = 0
     entry_submit_ts      = 0.0
-    hold_start_ts     = 0.0
-    last_adjust_ts    = 0.0
-    target_hold_secs  = HOLD_SECONDS
-    active_order_id   = None
-    entering_neutral_streak = 0   # consecutive neutral ticks seen while ENTERING
-    step              = 0
+    hold_start_ts        = 0.0
+    last_adjust_ts       = 0.0
+    target_hold_secs     = HOLD_SECONDS
+    hold_extension_count = 0
+    active_order_id      = None
+    entering_neutral_streak = 0
+    step                 = 0
 
     tracked_orders      = {}
     seen_execution_keys = set()
@@ -351,17 +269,9 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
             poll_executions(trader, tracked_orders, seen_execution_keys)
             next_exec_audit_ts = now_ts + EXEC_AUDIT_INTERVAL_SECONDS
 
-        # ------------------------------------------------------------------
-        # Book parse — always do this first so mid/spread are fresh for
-        # every order submission that follows in the same iteration.
-        # FIX: removed time.sleep() from the initial-snapshot continue path
-        # so we never sleep with a stale mid in hand.
-        # ------------------------------------------------------------------
         bids, asks = parse_shift_book(trader, symbol, levels)
 
         if not bids or not asks:
-            # No sleep here — fall through to the single sleep at the bottom
-            # so the full poll_interval is never wasted on a stale iteration.
             continue
 
         best_bid_p, _ = bids[0]
@@ -370,26 +280,18 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
         if best_ask_p <= best_bid_p:
             continue
 
-        # FIX: compute mid and spread immediately after the book parse so
-        # every code path below uses the freshest possible values.
         mid    = 0.5 * (best_bid_p + best_ask_p)
         spread = best_ask_p - best_bid_p
 
         if prev_bids is None or prev_asks is None:
             prev_bids = bids
             prev_asks = asks
-            # FIX: do NOT sleep here — fall through to the bottom sleep so
-            # only the remaining interval is consumed, not a full extra second.
             elapsed = time.time() - loop_start
             time.sleep(max(poll_interval - elapsed, 0.0))
             continue
 
-        # ------------------------------------------------------------------
-        # OFI / signal
-        # ------------------------------------------------------------------
         level_increment = compute_multilevel_ofi_increment(
-            prev_bids, prev_asks, bids, asks, levels
-        )
+            prev_bids, prev_asks, bids, asks, levels)
         ofi_events.append((now_ts, level_increment))
         prune_old_entries(ofi_events, now_ts, OFI_WINDOW_SECONDS)
 
@@ -404,7 +306,6 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                                   PERSISTENCE_REQUIRED, FINAL_SCORE_THRESHOLD)
         recent_signals.append(signal)
 
-        # Streak tracking
         if signal in ("BUY_PRESSURE", "SELL_PRESSURE"):
             if signal == prev_signal:
                 streak_count   += 1
@@ -419,50 +320,42 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
         pos_shares = get_position_shares(trader, symbol)
 
         # ------------------------------------------------------------------
-        # State machine — mid and spread are always fresh here
+        # State machine
         # ------------------------------------------------------------------
 
         if state == "FLAT":
             if pos_shares != 0:
-                # Residual position from a previous cycle — go straight to exit
                 state          = "EXITING"
                 last_adjust_ts = 0.0
 
-            elif (streak_count >= 2 and streak_max_ema > EMA_ENTRY_THRESHOLD) or (streak_count >= 5 and streak_max_ema > 0.8 * EMA_ENTRY_THRESHOLD):
+            elif (
+                (streak_count >= 2 and streak_max_ema > EMA_ENTRY_THRESHOLD)
+                or (streak_count >= 5 and streak_max_ema > 0.8 * EMA_ENTRY_THRESHOLD)
+            ):
                 if signal == "BUY_PRESSURE":
                     entry_side = "BUY"
                     entry_lots = TRADE_LOTS
                     entry_px   = sanitise_price(round_down_to_tick(mid + ENTRY_SPREAD_FRAC * spread))
                     active_order_id = submit_and_track_order(
                         trader, symbol, entry_side, entry_lots, entry_px,
-                        state, signal, step, tracked_orders
-                    )
+                        state, signal, step, tracked_orders)
                 else:
                     entry_side = "SELL"
                     entry_lots = TRADE_LOTS
                     entry_px   = sanitise_price(round_up_to_tick(mid - ENTRY_SPREAD_FRAC * spread))
                     active_order_id = submit_and_track_order(
                         trader, symbol, entry_side, entry_lots, entry_px,
-                        state, signal, step, tracked_orders
-                    )
+                        state, signal, step, tracked_orders)
 
                 state              = "ENTERING"
                 entry_submit_ts    = now_ts
-                entry_pos_snapshot = pos_shares   # always 0 from FLAT, but explicit
+                entry_pos_snapshot = pos_shares
                 streak_count       = 0
                 streak_max_ema     = 0.0
 
         elif state == "ENTERING":
             executed_orders = trader.get_executed_orders(active_order_id) if active_order_id else []
-            # FIX: check that position actually changed from when we submitted,
-            # not just that it is non-zero.  The old `pos_shares != 0` check
-            # fired immediately on flips because the pre-flip position was
-            # already non-zero, causing ENTERING to skip to HOLDING with the
-            # wrong (unchanged) position.
-            entry_filled = (
-                len(executed_orders) > 0
-                or pos_shares != entry_pos_snapshot
-            )
+            entry_filled = (len(executed_orders) > 0 or pos_shares != entry_pos_snapshot)
 
             if entry_filled:
                 cancel_all_open_orders(trader, symbol)
@@ -470,20 +363,10 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                 entering_neutral_streak = 0
                 state                   = "HOLDING"
                 target_hold_secs        = HOLD_SECONDS
-
-                # Try to anchor hold timer to the actual fill timestamp
-                if executed_orders:
-                    try:
-                        exec_time_str = str(getattr(executed_orders[0], "timestamp", ""))
-                        exec_dt       = datetime.strptime(exec_time_str, "%Y-%m-%d %H:%M:%S.%f")
-                        hold_start_ts = exec_dt.timestamp()
-                    except Exception:
-                        hold_start_ts = now_ts
-                else:
-                    hold_start_ts = now_ts
+                hold_extension_count    = 0
+                hold_start_ts           = now_ts   # always wall clock
 
             elif (
-                # Abort immediately on a full signal reversal
                 (entry_side == "BUY"  and signal == "SELL_PRESSURE") or
                 (entry_side == "SELL" and signal == "BUY_PRESSURE")
             ):
@@ -494,55 +377,63 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                 state                   = "FLAT"
 
             else:
-                # Track consecutive neutral ticks while waiting for a fill
                 if signal == "NEUTRAL":
                     entering_neutral_streak += 1
                 else:
                     entering_neutral_streak = 0
 
                 if entering_neutral_streak >= 4:
-                    # Signal has gone quiet — the momentum we traded on is gone
-                    print(f"[ENTERING] 4 consecutive neutral ticks — aborting entry")
+                    print("[ENTERING] 4 consecutive neutral ticks — aborting entry")
                     cancel_all_open_orders(trader, symbol)
                     active_order_id         = None
                     entering_neutral_streak = 0
                     state                   = "FLAT"
 
                 elif now_ts - entry_submit_ts >= 1.0:
-                    # Refresh entry order with current mid.
-                    # Uses entry_lots (not hardcoded TRADE_LOTS) so flip orders
-                    # reprice at the correct size (exit + new position).
                     cancel_order_by_id(trader, active_order_id)
                     if entry_side == "BUY":
                         entry_px = sanitise_price(round_down_to_tick(mid - ENTRY_SPREAD_FRAC * spread))
                         active_order_id = submit_and_track_order(
                             trader, symbol, "BUY", entry_lots, entry_px,
-                            state, signal, step, tracked_orders
-                        )
+                            state, signal, step, tracked_orders)
                     else:
                         entry_px = sanitise_price(round_up_to_tick(mid + ENTRY_SPREAD_FRAC * spread))
                         active_order_id = submit_and_track_order(
                             trader, symbol, "SELL", entry_lots, entry_px,
-                            state, signal, step, tracked_orders
-                        )
+                            state, signal, step, tracked_orders)
                     entry_submit_ts = now_ts
 
         elif state == "HOLDING":
             if now_ts - hold_start_ts >= target_hold_secs:
-                if target_hold_secs == HOLD_SECONDS:
-                    # FIX: require majority of recent_signals window to match,
-                    # not just the last 2 ticks.  With maxlen=5 we need 4/5.
-                    recent_list = list(recent_signals)
-                    extend_long  = (pos_shares > 0 and
-                                    recent_list.count("BUY_PRESSURE")  >= 3)
-                    extend_short = (pos_shares < 0 and
-                                    recent_list.count("SELL_PRESSURE") >= 3)
+                recent_list = list(recent_signals)
 
-                    if extend_long or extend_short:
-                        target_hold_secs += 2.0
-                    else:
-                        state          = "EXITING"
-                        last_adjust_ts = 0.0
+                # Trigger 1: same-direction streak >= 2 on current tick
+                same_dir_extend = (
+                    hold_extension_count < 5
+                    and (
+                        (pos_shares > 0 and signal == "BUY_PRESSURE"  and streak_count >= 2) or
+                        (pos_shares < 0 and signal == "SELL_PRESSURE" and streak_count >= 2)
+                    )
+                )
+
+                # Trigger 2: majority of recent window matches (3/3)
+                majority_extend = (
+                    hold_extension_count < 5
+                    and (
+                        (pos_shares > 0 and recent_list.count("BUY_PRESSURE")  >= 3) or
+                        (pos_shares < 0 and recent_list.count("SELL_PRESSURE") >= 3)
+                    )
+                )
+
+                if same_dir_extend or majority_extend:
+                    target_hold_secs     += 3.0
+                    hold_extension_count += 1
+                    print(
+                        f"[HOLDING] Extended hold by 3s "
+                        f"({'streak' if same_dir_extend else 'majority'}) "
+                        f"— extension {hold_extension_count}/5, "
+                        f"new target {target_hold_secs:.0f}s"
+                    )
                 else:
                     state          = "EXITING"
                     last_adjust_ts = 0.0
@@ -552,20 +443,25 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                 cancel_all_open_orders(trader, symbol)
                 active_order_id = None
                 state           = "FLAT"
-                # Reset streak so a signal that built up during the exit phase
-                # does not immediately trigger a new entry on the same tick.
-                streak_count   = 0
-                streak_max_ema = 0.0
+                # Only reset streak if same direction as the position we just
+                # exited. Preserve an opposite-direction streak so FLAT can
+                # immediately enter in the new direction.
+                exited_long  = entry_side == "BUY"
+                exited_short = entry_side == "SELL"
+                same_direction = (
+                    (exited_long  and signal == "BUY_PRESSURE") or
+                    (exited_short and signal == "SELL_PRESSURE")
+                )
+                if same_direction:
+                    streak_count   = 0
+                    streak_max_ema = 0.0
+                # opposite-direction streak preserved intentionally
+
             else:
-                # -------------------------------------------------------
-                # Flip logic: if an opposing signal strong enough to
-                # trigger a fresh entry develops while we are exiting,
-                # submit a single order for exit_lots + TRADE_LOTS so we
-                # close the current position AND open a new one in one shot.
-                # Condition mirrors the entry condition exactly.
-                # -------------------------------------------------------
+                # Flip uses EMA_FLIP_THRESHOLD (lower than EMA_ENTRY_THRESHOLD)
+                # because holding an opposing position is additional confirmation.
                 valid_flip_signal = (
-                    (streak_count >= 3 and streak_max_ema > EMA_ENTRY_THRESHOLD)
+                    (streak_count >= 3 and streak_max_ema > EMA_FLIP_THRESHOLD)
                     or streak_count >= 5
                 )
                 flip_to_short = pos_shares > 0 and signal == "SELL_PRESSURE" and valid_flip_signal
@@ -574,7 +470,7 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                 if flip_to_short or flip_to_long:
                     cancel_all_open_orders(trader, symbol)
                     exit_lots  = int(abs(pos_shares) / LOT_SIZE)
-                    flip_lots  = exit_lots + TRADE_LOTS   # close existing + open new
+                    flip_lots  = exit_lots + TRADE_LOTS
                     flip_side  = "SELL" if flip_to_short else "BUY"
                     entry_side = flip_side
 
@@ -589,15 +485,11 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                     )
                     active_order_id = submit_and_track_order(
                         trader, symbol, flip_side, flip_lots, flip_px,
-                        state, signal, step, tracked_orders
-                    )
-                    # Treat as a fresh entry — go to ENTERING so fill detection,
-                    # 1-second reprice, and neutral-streak abort all apply normally.
-                    # entry_lots is set to flip_lots so the reprice uses the right size.
+                        state, signal, step, tracked_orders)
                     entry_lots              = flip_lots
                     state                   = "ENTERING"
                     entry_submit_ts         = now_ts
-                    entry_pos_snapshot      = pos_shares  # non-zero for flips
+                    entry_pos_snapshot      = pos_shares
                     entering_neutral_streak = 0
                     streak_count            = 0
                     streak_max_ema          = 0.0
@@ -607,19 +499,17 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
                     exit_lots = int(abs(pos_shares) / LOT_SIZE)
                     if exit_lots > 0:
                         if pos_shares > 0:
-                            # Exit long: SELL just inside the spread from the ask side.
-                            exit_px = sanitise_price(round_down_to_tick(best_ask_p - EXIT_SPREAD_FRAC * spread))
+                            exit_px = sanitise_price(
+                                round_down_to_tick(best_ask_p - EXIT_SPREAD_FRAC * spread))
                             active_order_id = submit_and_track_order(
                                 trader, symbol, "SELL", exit_lots, exit_px,
-                                state, signal, step, tracked_orders
-                            )
+                                state, signal, step, tracked_orders)
                         else:
-                            # Exit short: BUY just inside the spread from the bid side.
-                            exit_px = sanitise_price(round_up_to_tick(best_bid_p + EXIT_SPREAD_FRAC * spread))
+                            exit_px = sanitise_price(
+                                round_up_to_tick(best_bid_p + EXIT_SPREAD_FRAC * spread))
                             active_order_id = submit_and_track_order(
                                 trader, symbol, "BUY", exit_lots, exit_px,
-                                state, signal, step, tracked_orders
-                            )
+                                state, signal, step, tracked_orders)
                     last_adjust_ts = now_ts
 
         print(
@@ -641,10 +531,6 @@ def run_directional_strategy(trader, symbol=SYMBOL, levels=LEVELS,
     poll_executions(trader, tracked_orders, seen_execution_keys)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     with shift.Trader("columbia-traders") as trader:
         trader.connect("initiator.cfg", "aRkkZSrj")
@@ -655,11 +541,7 @@ if __name__ == "__main__":
         end_time = datetime.now() + timedelta(minutes=500.0)
         try:
             run_directional_strategy(
-                trader,
-                symbol=SYMBOL,
-                levels=LEVELS,
-                poll_interval=POLL_INTERVAL,
-                end_time=end_time,
-            )
+                trader, symbol=SYMBOL, levels=LEVELS,
+                poll_interval=POLL_INTERVAL, end_time=end_time)
         except KeyboardInterrupt:
             trader.disconnect()
