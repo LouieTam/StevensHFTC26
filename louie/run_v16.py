@@ -7,6 +7,14 @@ import statistics
 from collections import deque
 from datetime import datetime, timedelta
 
+# holding 15 seconds once enter
+# Fine with running on Aug 05
+# FIXED: not enough bp to close short
+# FIXED: entry now uses limit order at mid (repriced every ENTRY_REPRICE_SECONDS)
+# FIXED: BP check verifies we can afford to close the full resulting position
+# FIXED: large entries chunked into ENTRY_CHUNK_LOTS per order
+# FIXED: large exits chunked into EXIT_NUM_CHUNKS pieces when > EXIT_CHUNK_THRESHOLD
+
 SYMBOL = "NVDA"
 LEVELS = 10
 POLL_INTERVAL = 1.0
@@ -18,14 +26,15 @@ LEVEL_WEIGHTS = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 PERSISTENCE_LOOKBACK   = 6
 PERSISTENCE_REQUIRED   = 5
 FINAL_SCORE_THRESHOLD  = 0.5
-OFI_FLOOR_Z            = 0.5
+OFI_FLOOR_Z            = 0.8
+
 
 ZSCORE_WINDOW   = 60
 ZSCORE_WARMUP   = 30
 
-BUY_TIER1_Z    = 1.8
+BUY_TIER1_Z    = 1.7
 BUY_TIER2_Z    = 2.3
-SELL_TIER1_Z   = 1.8
+SELL_TIER1_Z   = 1.7
 SELL_TIER2_Z   = 2.3
 OVERLAP_MIN_Z  = 1.5
 
@@ -34,31 +43,22 @@ STREAK_BUY_Z          = 1.6
 SELL_STREAK_TRIGGER   = 5
 STREAK_SELL_Z         = 1.6
 
-# ── Position caps ─────────────────────────────────────────────────────────────
-MAX_LONG_LOTS  = 10   # maximum long position in lots
-MAX_SHORT_LOTS = 10   # maximum short position in lots (stored as positive)
+TICK_SIZE  = 0.01
+LOT_SIZE   = 100
 
-TICK_SIZE = 0.01
-LOT_SIZE  = 100
+ENTRY_REPRICE_SECONDS = 2.0
+ENTRY_AGGR_FRAC       = 0.35
+ENTRY_CHUNK_LOTS      = 5
 
-# ── Entry: market orders (fast execution on volatile moves) ───────────────────
-# Market orders cross the spread immediately — better for catching directional
-# moves before they pass. We use market_oid guard to prevent stacked orders.
+EXIT_REPRICE_SECONDS  = 2.0
+EXIT_AGGR_FRAC        = 0.0
+EXIT_CHUNK_THRESHOLD  = 8   # chunk exits larger than this many lots
+EXIT_NUM_CHUNKS       = 2   # number of equal chunks to split into
 
-# ── Exit limit order settings ─────────────────────────────────────────────────
-EXIT_REPRICE_SECONDS = 2.0
-EXIT_AGGR_FRAC       = 0.2
-
-# ── Competition rules ─────────────────────────────────────────────────────────
-PROFIT_TARGET_USD      = 5000.0   # stop trading once realized P&L exceeds this
-MIN_TRADES_REQUIRED    = 200      # minimum unique executed trades required
-TRADE_PUSH_MINUTES     = 30       # minutes before end_time to start pushing trades
-
-# ── Order chunking ────────────────────────────────────────────────────────────
-# Orders larger than CHUNK_THRESHOLD lots are split into 2 equal chunks.
-# The first chunk fires immediately; the second fires automatically on the
-# next tick once the first fill is confirmed (via market_oid / exit reprice).
-CHUNK_THRESHOLD = 8
+# ── Hold period ───────────────────────────────────────────────────────────────
+# Once in a position, hold for exactly HOLD_SECONDS then liquidate regardless
+# of signal. Set to None to disable (signal-driven exit only).
+HOLD_SECONDS = 15
 
 SUBMISSION_LOG_PATH = "ofi_pyramid_submissions.csv"
 EXECUTION_LOG_PATH  = "ofi_pyramid_executions.csv"
@@ -72,6 +72,17 @@ def round_to_tick(x):
 
 def sanitise_price(p):
     return round(float(p), 2)
+
+def exit_chunk_size(pos_lots):
+    """Ceiling-divide position into EXIT_NUM_CHUNKS, or close all if small."""
+    total = abs(pos_lots)
+    if total <= EXIT_CHUNK_THRESHOLD:
+        return total
+    return math.ceil(total / EXIT_NUM_CHUNKS)
+
+# ---------------------------------------------------------------------------
+# Z-score helper
+# ---------------------------------------------------------------------------
 
 def compute_zscore(ema_t, ema_history):
     n = len(ema_history)
@@ -121,8 +132,6 @@ def log_execution(sim_time, order_id, symbol, side, exec_price, exec_size,
 # ---------------------------------------------------------------------------
 
 def poll_executions(trader, tracked_orders, seen_keys):
-    """Returns the number of new execution records logged this call."""
-    new_fills = 0
     sim_time = trader.get_last_trade_time()
     for oid, meta in list(tracked_orders.items()):
         try:
@@ -134,7 +143,6 @@ def poll_executions(trader, tracked_orders, seen_keys):
                            str(getattr(ex, "status", "")))
                     if key not in seen_keys:
                         seen_keys.add(key)
-                        new_fills += 1
                         exec_ts = getattr(ex, "timestamp", "")
                         print(f"[FILL] {meta['side']} {sz} {meta['symbol']} "
                               f"@ {px:.4f} | status={getattr(ex,'status','')} "
@@ -156,7 +164,6 @@ def poll_executions(trader, tracked_orders, seen_keys):
             pass
     for oid in [k for k, v in tracked_orders.items() if v.get("done")]:
         del tracked_orders[oid]
-    return new_fills
 
 # ---------------------------------------------------------------------------
 # Order book / OFI
@@ -240,28 +247,8 @@ def get_bp(trader):
 def cancel_all(trader, symbol):
     trader.cancel_all_pending_orders()
 
-def submit_market_order(trader, symbol, side, lots, reason, step,
-                        tracked_orders, pos_before):
-    """Submit a market order for entries. Fast fill, no reprice needed."""
-    if lots <= 0:
-        return None
-    sim_time = trader.get_last_trade_time()
-    if side == "BUY":
-        order = shift.Order(shift.Order.Type.MARKET_BUY,  symbol, int(lots))
-    else:
-        order = shift.Order(shift.Order.Type.MARKET_SELL, symbol, int(lots))
-    trader.submit_order(order)
-    tracked_orders[order.id] = {
-        "symbol": symbol, "side": side, "lots": int(lots), "done": False,
-    }
-    log_submission(sim_time, order.id, symbol, side, "MARKET",
-                   lots * LOT_SIZE, reason, step, pos_before)
-    print(f"[ORDER] {side} {lots}L MARKET {symbol} | {reason}", flush=True)
-    return order.id
-
 def submit_limit_order(trader, symbol, side, lots, price, reason, step,
                        tracked_orders, pos_before):
-    """Submit a limit order for exits."""
     if lots <= 0:
         return None
     sim_time = trader.get_last_trade_time()
@@ -300,7 +287,7 @@ def has_enough_bp(trader, side, lots, price_est, current_pos_shares):
     return False
 
 # ---------------------------------------------------------------------------
-# Target accumulator — with MAX_LONG_LOTS and MAX_SHORT_LOTS caps
+# Target accumulator
 # ---------------------------------------------------------------------------
 
 def update_target_accumulator(signal, ema_z, zscore_valid, current_lots,
@@ -309,12 +296,8 @@ def update_target_accumulator(signal, ema_z, zscore_valid, current_lots,
     if not zscore_valid:
         return current_lots, buy_acc, sell_acc, neutral_streak
 
-    effective_buy_tier1  = (STREAK_BUY_Z
-                            if buy_signal_streak  >= BUY_STREAK_TRIGGER
-                            else BUY_TIER1_Z)
-    effective_sell_tier1 = (STREAK_SELL_Z
-                            if sell_signal_streak >= SELL_STREAK_TRIGGER
-                            else SELL_TIER1_Z)
+    effective_buy_tier1  = STREAK_BUY_Z  if buy_signal_streak  >= BUY_STREAK_TRIGGER  else BUY_TIER1_Z
+    effective_sell_tier1 = STREAK_SELL_Z if sell_signal_streak >= SELL_STREAK_TRIGGER else SELL_TIER1_Z
 
     if signal == "BUY_PRESSURE":
         neutral_streak = 0
@@ -327,9 +310,6 @@ def update_target_accumulator(signal, ema_z, zscore_valid, current_lots,
             buy_acc = buy_acc + 2
         else:
             return current_lots, buy_acc, 0, 0
-
-        # ── Cap long position at MAX_LONG_LOTS ────────────────────────────
-        buy_acc = min(buy_acc, MAX_LONG_LOTS)
         return buy_acc, buy_acc, 0, 0
 
     elif signal == "SELL_PRESSURE":
@@ -344,17 +324,11 @@ def update_target_accumulator(signal, ema_z, zscore_valid, current_lots,
             sell_acc = sell_acc + 1
         else:
             return current_lots, 0, sell_acc, 0
-
-        # ── Cap short position at MAX_SHORT_LOTS ──────────────────────────
-        sell_acc = min(sell_acc, MAX_SHORT_LOTS)
-        print_cap = sell_acc == MAX_SHORT_LOTS
-        if print_cap:
-            print(f"[CAP] Short position capped at {MAX_SHORT_LOTS}L", flush=True)
         return -sell_acc, 0, sell_acc, 0
 
     else:  # NEUTRAL — grace period
         neutral_streak += 1
-        if neutral_streak >= 7:
+        if neutral_streak >= 2:
             return 0, 0, 0, neutral_streak
         else:
             current_target = buy_acc if buy_acc > 0 else -sell_acc
@@ -381,91 +355,44 @@ def run_strategy(trader, symbol=SYMBOL, end_time=None):
     buy_signal_streak  = 0
     sell_signal_streak = 0
 
-    # market_oid guard — set after submitting a market entry order.
-    # Cleared when pos_lots changes. Prevents stacked market orders.
-    market_oid     = None
-    last_known_pos = 0
+    entry_oid        = None
+    entry_side       = None
+    entry_lots       = 0
+    entry_submit_ts  = 0.0
+    entry_target     = 0
 
-    # Exit limit order state
     exit_oid       = None
     exit_side      = None
     exit_lots      = 0
     exit_submit_ts = 0.0
 
-    tracked_orders  = {}
-    seen_keys       = set()
-    unique_trades   = 0   # count of unique execution records — for competition minimum
-    step            = 0
+    entry_time = None   # wall-clock time when position was first opened
 
-    profit_target_hit = False
-    trade_push_time   = end_time - timedelta(minutes=TRADE_PUSH_MINUTES)
+    tracked_orders = {}
+    seen_keys      = set()
+    step           = 0
 
     while trader.get_last_trade_time() < end_time:
 
         sim_time = trader.get_last_trade_time()
-        unique_trades += poll_executions(trader, tracked_orders, seen_keys)
+        poll_executions(trader, tracked_orders, seen_keys)
 
-        # ── Competition rule 1: stop trading once P&L target is hit ──────────
-        realized_pl = trader.get_portfolio_summary().get_total_realized_pl()
-        if realized_pl >= PROFIT_TARGET_USD and not profit_target_hit:
-            profit_target_hit = True
-            print(f"[PROFIT TARGET] Realized P&L ${realized_pl:.2f} >= "
-                  f"${PROFIT_TARGET_USD:.0f} — stopping new entries", flush=True)
-
-        if profit_target_hit:
-            # Still manage exits to flatten any open position, but no new entries
-            pos_shares = get_pos(trader, symbol)
-            if pos_shares == 0:
-                print(f"[PROFIT TARGET] Flat — waiting for end. "
-                      f"Trades: {unique_trades}/{MIN_TRADES_REQUIRED}", flush=True)
-                time.sleep(POLL_INTERVAL)
-                continue
-
-        # ── Competition rule 2: push trades if < 200 with 30 min to go ───────
-        if (sim_time >= trade_push_time
-                and unique_trades < MIN_TRADES_REQUIRED):
-            needed = MIN_TRADES_REQUIRED - unique_trades
-            print(f"[TRADE PUSH] {unique_trades}/{MIN_TRADES_REQUIRED} trades — "
-                  f"need {needed} more. Submitting 1L market buy+sell.", flush=True)
-            cancel_all(trader, symbol)
-            # Submit a 1-lot buy and a 1-lot sell — two market orders, two fills,
-            # each counts as a unique execution record toward the minimum.
-            buy_order  = shift.Order(shift.Order.Type.MARKET_BUY,  symbol, 1)
-            sell_order = shift.Order(shift.Order.Type.MARKET_SELL, symbol, 1)
-            trader.submit_order(buy_order)
-            trader.submit_order(sell_order)
-            tracked_orders[buy_order.id]  = {"symbol": symbol, "side": "BUY",
-                                              "lots": 1, "done": False}
-            tracked_orders[sell_order.id] = {"symbol": symbol, "side": "SELL",
-                                             "lots": 1, "done": False}
-            log_submission(sim_time, buy_order.id,  symbol, "BUY",  "MARKET",
-                           LOT_SIZE, "trade_push", step, get_pos(trader, symbol))
-            log_submission(sim_time, sell_order.id, symbol, "SELL", "MARKET",
-                           LOT_SIZE, "trade_push", step, get_pos(trader, symbol))
-            time.sleep(1.0)   # let them fill before next tick
-            continue
-
-        # ── Book parse ────────────────────────────────────────────────────────
         bids, asks = parse_book(trader, symbol, LEVELS)
         if not bids or not asks:
-            time.sleep(POLL_INTERVAL)
-            continue
+            time.sleep(POLL_INTERVAL); continue
 
         best_bid, _ = bids[0]
         best_ask, _ = asks[0]
         if best_ask <= best_bid:
-            time.sleep(POLL_INTERVAL)
-            continue
+            time.sleep(POLL_INTERVAL); continue
 
         mid    = 0.5 * (best_bid + best_ask)
         spread = best_ask - best_bid
 
         if prev_bids is None or prev_asks is None:
             prev_bids, prev_asks = bids, asks
-            time.sleep(POLL_INTERVAL)
-            continue
+            time.sleep(POLL_INTERVAL); continue
 
-        # ── OFI / signal ──────────────────────────────────────────────────────
         inc = multilevel_ofi(prev_bids, prev_asks, bids, asks, LEVELS)
         ofi_events.append((time.time(), inc))
         prune(ofi_events, time.time(), OFI_WINDOW_SECONDS)
@@ -473,7 +400,6 @@ def run_strategy(trader, symbol=SYMBOL, end_time=None):
         raw_ofi  = weighted_ofi(rolling_ofi(ofi_events, LEVELS), LEVEL_WEIGHTS)
         ema_t    = ema_update(ema_t, raw_ofi, EMA_ALPHA)
         raw_ofi_history.append(raw_ofi)
-
         ema_history.append(ema_t)
         ema_z, zscore_valid = compute_zscore(ema_t, ema_history)
 
@@ -482,79 +408,63 @@ def run_strategy(trader, symbol=SYMBOL, end_time=None):
         signal  = classify_signal(ema_dir, pos_count, neg_count, pscore,
                                   PERSISTENCE_REQUIRED, FINAL_SCORE_THRESHOLD)
 
-        # ── Streak counters ───────────────────────────────────────────────────
         if signal == "BUY_PRESSURE":
-            buy_signal_streak  += 1
-            sell_signal_streak  = 0
+            buy_signal_streak  += 1; sell_signal_streak  = 0
         elif signal == "SELL_PRESSURE":
-            sell_signal_streak += 1
-            buy_signal_streak   = 0
+            sell_signal_streak += 1; buy_signal_streak   = 0
         else:
-            buy_signal_streak  = 0
-            sell_signal_streak = 0
+            buy_signal_streak  = 0;  sell_signal_streak  = 0
 
-        # ── Position ──────────────────────────────────────────────────────────
         pos_shares = get_pos(trader, symbol)
         pos_lots   = pos_shares // LOT_SIZE
 
-        # ── market_oid guard: detect fill via position change ─────────────────
-        if market_oid is not None:
-            if pos_lots != last_known_pos:
-                print(f"[FILL CONFIRMED] Pos {last_known_pos:+d} → {pos_lots:+d}L",
-                      flush=True)
-                last_known_pos = pos_lots
-                market_oid     = None
-            else:
-                # Safety: clear if order was rejected/cancelled
-                try:
-                    o = trader.get_order(market_oid)
-                    if o is not None:
-                        s = str(getattr(o, "status", ""))
-                        if "CANCELED" in s or "REJECTED" in s:
-                            print(f"[WARN] Market order {market_oid[:8]}… {s} — clearing",
-                                  flush=True)
-                            market_oid = None
-                except Exception:
-                    pass
-        else:
-            last_known_pos = pos_lots
+        # Track when we first enter a position; reset when flat
+        if pos_lots != 0 and entry_time is None:
+            entry_time = time.time()
+        elif pos_lots == 0:
+            entry_time = None
 
-        # ── Target accumulator ────────────────────────────────────────────────
-        # Freeze accumulator while market order is in flight — prevents
-        # inflating target before the previous fill is confirmed.
-        if market_oid is None:
-            target_lots, buy_acc, sell_acc, neutral_streak = update_target_accumulator(
-                signal, ema_z, zscore_valid, pos_lots, buy_acc, sell_acc, neutral_streak,
-                buy_signal_streak, sell_signal_streak
-            )
-        else:
-            # Recompute target from frozen accumulators without incrementing
-            if signal == "BUY_PRESSURE":
-                target_lots = buy_acc
-            elif signal == "SELL_PRESSURE":
-                target_lots = -sell_acc
-            else:
-                neutral_streak += 1
-                if neutral_streak >= 7:
-                    target_lots = 0; buy_acc = 0; sell_acc = 0
-                else:
-                    target_lots = buy_acc if buy_acc > 0 else -sell_acc
-            print(f"[WAITING] market order in flight | pos={pos_lots:+d} "
-                  f"target={target_lots:+d}", flush=True)
+        target_lots, buy_acc, sell_acc, neutral_streak = update_target_accumulator(
+            signal, ema_z, zscore_valid, pos_lots, buy_acc, sell_acc, neutral_streak,
+            buy_signal_streak, sell_signal_streak
+        )
 
-        delta_lots = target_lots - pos_lots
+        delta_lots  = target_lots - pos_lots
+        is_exit     = (target_lots == 0 and pos_lots != 0)
 
-        # ── Classify action ───────────────────────────────────────────────────
-        is_exit    = (target_lots == 0 and pos_lots != 0)
-        is_entry   = (target_lots != 0 and pos_lots == 0)
-        is_flip    = (target_lots != 0 and pos_lots != 0
-                      and (target_lots > 0) != (pos_lots > 0))
-        is_add     = (target_lots != 0 and pos_lots != 0
-                      and (target_lots > 0) == (pos_lots > 0)
-                      and abs(target_lots) > abs(pos_lots))
+        # Override: force exit if hold period has elapsed
+        if (HOLD_SECONDS is not None
+                and entry_time is not None
+                and pos_lots != 0
+                and (time.time() - entry_time) >= HOLD_SECONDS):
+            is_exit     = True
+            target_lots = 0
+            delta_lots  = -pos_lots
+            buy_acc     = 0
+            sell_acc    = 0
+
+        is_entry    = (target_lots != 0 and pos_lots == 0)
+        is_flip     = (target_lots != 0 and pos_lots != 0
+                       and (target_lots > 0) != (pos_lots > 0))
+        is_add      = (target_lots != 0 and pos_lots != 0
+                       and (target_lots > 0) == (pos_lots > 0)
+                       and abs(target_lots) > abs(pos_lots))
         wants_entry = is_entry or is_add or is_flip
 
-        # ── Exit order status check ───────────────────────────────────────────
+        # ── Entry order status ────────────────────────────────────────────────
+        if entry_oid:
+            cur = trader.get_order(entry_oid)
+            if cur is None:
+                entry_oid = None; entry_side = None; entry_lots = 0
+            else:
+                s = str(getattr(cur, "status", ""))
+                if "FILLED" in s and "PARTIALLY" not in s:
+                    print(f"[ENTRY FILLED] {entry_side} {entry_lots}L", flush=True)
+                    entry_oid = None; entry_side = None; entry_lots = 0
+                elif "CANCELED" in s or "REJECTED" in s:
+                    entry_oid = None; entry_side = None; entry_lots = 0
+
+        # ── Exit order status ─────────────────────────────────────────────────
         if exit_oid:
             cur = trader.get_order(exit_oid)
             if cur is None:
@@ -569,127 +479,129 @@ def run_strategy(trader, symbol=SYMBOL, end_time=None):
         # ── Order management ──────────────────────────────────────────────────
 
         if delta_lots == 0 and not is_exit:
-            # Nothing to do — cancel any stale exit order
-            if exit_oid:
+            if entry_oid:
                 cancel_all(trader, symbol)
-                exit_oid = None; exit_side = None; exit_lots = 0
+                entry_oid = None; entry_side = None; entry_lots = 0
+                print(f"[ENTRY CANCELLED] delta=0, target={target_lots}", flush=True)
 
         elif is_exit:
-            # ── EXIT: limit order, repriced every EXIT_REPRICE_SECONDS ───────
-            order_side  = "BUY" if delta_lots > 0 else "SELL"
-            order_lots  = abs(delta_lots)
+            order_side = "BUY" if delta_lots > 0 else "SELL"
+
+            if entry_oid:
+                cancel_all(trader, symbol)
+                entry_oid = None; entry_side = None; entry_lots = 0
+
+            # Refresh position and compute chunk size
+            pos_shares = get_pos(trader, symbol)
+            pos_lots   = pos_shares // LOT_SIZE
+            chunk      = exit_chunk_size(pos_lots)
+
             if order_side == "BUY":
                 order_price = sanitise_price(round_to_tick(mid + EXIT_AGGR_FRAC * spread))
             else:
                 order_price = sanitise_price(round_to_tick(mid - EXIT_AGGR_FRAC * spread))
 
+            # Only cancel/reprice when needed — preserves the 2s timer
             same_exit      = (exit_oid is not None
                               and exit_side == order_side
-                              and exit_lots == order_lots)
+                              and exit_lots == chunk)
             age            = time.time() - exit_submit_ts
             should_reprice = (not same_exit) or (age >= EXIT_REPRICE_SECONDS)
 
-            if should_reprice:
-                cancel_all(trader, symbol)
-                exit_oid   = None
-                pos_shares = get_pos(trader, symbol)
-                pos_lots   = pos_shares // LOT_SIZE
-                order_lots = abs(target_lots - pos_lots)
-                if order_lots > 0:
-                    # ── Chunk: split exits > CHUNK_THRESHOLD into 2 halves ────
-                    # Submit only the first chunk now. After it fills, pos_lots
-                    # updates and the exit reprice fires the second chunk.
-                    if order_lots > CHUNK_THRESHOLD:
-                        chunk_lots = math.ceil(order_lots / 2)
-                        print(f"[CHUNK] EXIT {order_lots}L → submitting chunk 1 of 2 "
-                              f"({chunk_lots}L), remainder on reprice", flush=True)
-                        order_lots = chunk_lots
+            if should_reprice and chunk > 0:
+                if exit_oid:
+                    cancel_all(trader, symbol)
+                    exit_oid = None
+                reason   = (f"EXIT target=0 cur={pos_lots} "
+                            f"chunk={chunk}/{abs(pos_lots)} "
+                            f"sig={signal} ema_z={ema_z:.2f}")
+                exit_oid = submit_limit_order(
+                    trader, symbol, order_side, chunk, order_price,
+                    reason, step, tracked_orders, pos_shares
+                )
+                if exit_oid:
+                    exit_side      = order_side
+                    exit_lots      = chunk
+                    exit_submit_ts = time.time()
 
-                    reason   = (f"EXIT target=0 cur={pos_lots} "
-                                f"sig={signal} ema_z={ema_z:.2f}")
-                    exit_oid = submit_limit_order(
-                        trader, symbol, order_side, order_lots, order_price,
-                        reason, step, tracked_orders, pos_shares
-                    )
-                    if exit_oid:
-                        exit_side      = order_side
-                        exit_lots      = order_lots
-                        exit_submit_ts = time.time()
-
-        elif wants_entry and market_oid is None and not profit_target_hit:
-            # ── ENTRY / ADD / FLIP: market order ─────────────────────────────
-            # Only submit if no market order is currently in flight.
+        elif wants_entry:
             order_side = "BUY" if delta_lots > 0 else "SELL"
             order_lots = abs(delta_lots)
 
-            # Cancel any resting exit order before entering
             if exit_oid:
                 cancel_all(trader, symbol)
                 exit_oid = None; exit_side = None; exit_lots = 0
 
-            # BP check — degrade flip to close-only if insufficient
             if not has_enough_bp(trader, order_side, order_lots, mid, pos_shares):
                 if is_flip and pos_lots != 0:
-                    order_lots = abs(pos_lots)
-                    print(f"[BP] Degrading flip to exit-only: {order_lots}L", flush=True)
+                    close_lots = abs(pos_lots)
+                    print(f"[BP] Degrading flip to exit-only: {close_lots}L", flush=True)
+                    order_lots = close_lots
                 else:
                     order_lots = 0
 
             if order_lots > 0:
-                # ── Chunk: split orders > CHUNK_THRESHOLD into 2 halves ───────
-                # Submit only the first chunk now. The market_oid guard ensures
-                # the second chunk fires automatically on the next tick after
-                # the first fill is confirmed via pos_lots changing.
-                if order_lots > CHUNK_THRESHOLD:
-                    chunk_lots = math.ceil(order_lots / 2)
-                    print(f"[CHUNK] {order_lots}L → submitting chunk 1 of 2 "
-                          f"({chunk_lots}L), remainder on next fill", flush=True)
-                    order_lots = chunk_lots
+                order_lots = min(order_lots, ENTRY_CHUNK_LOTS)
 
-                action = ("ENTRY" if is_entry else
-                          "FLIP"  if is_flip  else "ADD")
-                if buy_signal_streak >= BUY_STREAK_TRIGGER:
-                    streak_tag = f" [BSTREAK={buy_signal_streak}]"
-                elif sell_signal_streak >= SELL_STREAK_TRIGGER:
-                    streak_tag = f" [SSTREAK={sell_signal_streak}]"
-                else:
-                    streak_tag = ""
-                reason = (f"MKT-{action}{streak_tag} target={target_lots} "
-                          f"cur={pos_lots} sig={signal} z={ema_z:.2f}")
-                oid = submit_market_order(
-                    trader, symbol, order_side, order_lots,
-                    reason, step, tracked_orders, pos_shares
-                )
-                if oid:
-                    market_oid = oid   # freeze until pos changes
+                signal_flipped = (entry_oid is not None and entry_side != order_side)
+                target_changed = (entry_oid is not None and entry_target != target_lots)
+                age            = time.time() - entry_submit_ts
+                first_submit   = (entry_oid is None)
+                should_reprice = (first_submit or signal_flipped or target_changed
+                                  or age >= ENTRY_REPRICE_SECONDS)
 
-        elif wants_entry and market_oid is not None:
-            print(f"[SKIP] Market order {market_oid[:8]}… in flight — not stacking",
-                  flush=True)
+                if signal_flipped:
+                    cancel_all(trader, symbol)
+                    entry_oid = None; entry_side = None; entry_lots = 0
+                    print(f"[ENTRY CANCELLED] signal flipped to {signal}", flush=True)
 
-        # ── Status line ───────────────────────────────────────────────────────
+                if should_reprice:
+                    if entry_oid:
+                        cancel_all(trader, symbol)
+                        entry_oid = None
+
+                    if order_side == "BUY":
+                        order_price = sanitise_price(round_to_tick(mid + ENTRY_AGGR_FRAC * spread))
+                    else:
+                        order_price = sanitise_price(round_to_tick(mid - ENTRY_AGGR_FRAC * spread))
+
+                    action = "ENTRY" if is_entry else "FLIP" if is_flip else "ADD"
+                    if buy_signal_streak >= BUY_STREAK_TRIGGER:
+                        streak_tag = f" [BUY_STREAK={buy_signal_streak}->tier1z={STREAK_BUY_Z}]"
+                    elif sell_signal_streak >= SELL_STREAK_TRIGGER:
+                        streak_tag = f" [SELL_STREAK={sell_signal_streak}->tier1z={STREAK_SELL_Z}]"
+                    else:
+                        streak_tag = ""
+                    reason = (f"LMT-{action}{streak_tag} target={target_lots} cur={pos_lots} "
+                              f"chunk={order_lots} sig={signal} ema={ema_t:.1f} z={ema_z:.2f}")
+                    oid = submit_limit_order(
+                        trader, symbol, order_side, order_lots, order_price,
+                        reason, step, tracked_orders, pos_shares
+                    )
+                    if oid:
+                        entry_oid       = oid
+                        entry_side      = order_side
+                        entry_lots      = order_lots
+                        entry_submit_ts = time.time()
+                        entry_target    = target_lots
+
+        # ── Log line ──────────────────────────────────────────────────────────
         if buy_signal_streak >= BUY_STREAK_TRIGGER:
             streak_indicator = f"*BSTREAK{buy_signal_streak}*"
         elif sell_signal_streak >= SELL_STREAK_TRIGGER:
             streak_indicator = f"*SSTREAK{sell_signal_streak}*"
         else:
-            streak_indicator = f"Bstr={buy_signal_streak}/Sstr={sell_signal_streak}"
-
-        cap_indicator  = ""
-        if buy_acc  >= MAX_LONG_LOTS:  cap_indicator = " [LONG_CAP]"
-        if sell_acc >= MAX_SHORT_LOTS: cap_indicator = " [SHORT_CAP]"
+            streak_indicator = f"Bstreak={buy_signal_streak}/Sstreak={sell_signal_streak}"
 
         warmup_tag = "" if zscore_valid else " [WARMUP]"
         print(
             f"[{sim_time}][{symbol}] "
-            f"Sig: {signal:14s} | Z: {ema_z:+.2f}{warmup_tag} | "
-            f"Pos: {pos_lots:+3d}L | Target: {target_lots:+3d}L{cap_indicator} | "
+            f"Sig: {signal:14s} | EMA: {ema_t:8.2f} | Z: {ema_z:+.2f}{warmup_tag} | "
+            f"Pos: {pos_lots:+3d}L | Target: {target_lots:+3d}L | "
             f"Delta: {delta_lots:+3d}L | Acc: B{buy_acc}/S{sell_acc} | "
             f"Mid: {mid:.4f} | {streak_indicator} | "
-            f"MktOrd: {'YES' if market_oid else 'no ':3s} | "
+            f"Entry: {'YES' if entry_oid else 'no ':3s} | "
             f"Exit: {'YES' if exit_oid else 'no ':3s} | "
-            f"Trades: {unique_trades}/{MIN_TRADES_REQUIRED} | "
-            f"PnL: ${realized_pl:.0f} | "
             f"BP: {get_bp(trader):.0f}",
             flush=True
         )
@@ -705,13 +617,17 @@ def run_strategy(trader, symbol=SYMBOL, end_time=None):
           flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     with shift.Trader("columbia-traders") as trader:
         trader.connect("initiator.cfg", "aRkkZSrj")
         time.sleep(1.0)
         trader.sub_all_order_book()
         time.sleep(1.0)
-        end_time = trader.get_last_trade_time() + timedelta(minutes=380.0)
+        end_time = trader.get_last_trade_time() + timedelta(minutes=500.0)
         try:
             run_strategy(trader, symbol=SYMBOL, end_time=end_time)
         except KeyboardInterrupt:
