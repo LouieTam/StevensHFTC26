@@ -7,7 +7,7 @@ import statistics
 from collections import deque
 from datetime import datetime, timedelta
 
-SYMBOL = "NVDA"
+SYMBOL = "MSFT"
 LEVELS = 10
 POLL_INTERVAL = 1.0
 OFI_WINDOW_SECONDS = 10.0
@@ -23,16 +23,16 @@ OFI_FLOOR_Z            = 0.5
 ZSCORE_WINDOW   = 60
 ZSCORE_WARMUP   = 30
 
-BUY_TIER1_Z    = 1.8
-BUY_TIER2_Z    = 2.3
-SELL_TIER1_Z   = 1.8
-SELL_TIER2_Z   = 2.3
-OVERLAP_MIN_Z  = 1.5
+BUY_TIER1_Z    = 2.0
+BUY_TIER2_Z    = 2.5
+SELL_TIER1_Z   = 2.0
+SELL_TIER2_Z   = 2.5
+OVERLAP_MIN_Z  = 1.8
 
 BUY_STREAK_TRIGGER    = 5
-STREAK_BUY_Z          = 1.6
+STREAK_BUY_Z          = 1.8
 SELL_STREAK_TRIGGER   = 5
-STREAK_SELL_Z         = 1.6
+STREAK_SELL_Z         = 1.8
 
 # ── Position caps ─────────────────────────────────────────────────────────────
 MAX_LONG_LOTS  = 10   # maximum long position in lots
