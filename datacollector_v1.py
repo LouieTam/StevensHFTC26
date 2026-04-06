@@ -7,7 +7,7 @@ from datetime import timedelta
 
 POLL_INTERVAL = 1.0
 LEVELS = 10
-DATA_DIR = "market_data_20250116_v1"
+DATA_DIR = "market_data_20241015"
 
 file_handles = {}
 csv_writers = {}
