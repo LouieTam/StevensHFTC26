@@ -1,607 +1,507 @@
 import shift
-import pandas as pd
 import time
-import sys
-import numpy as np
-import helper
-import datetime as dt
-import math
-import bisect
-from collections import defaultdict
+import csv
 import os
-#round 3 MM
+from collections import deque
+from datetime import datetime, timedelta
+#Round 3 MM
 
-# Constants
-TRADER_ID = "columbia-traders"
-CFG_FILE = "initiator.cfg"
-PASSWORD = "aRkkZSrj"
-max_balance = 1000000.0
-perStock_Limit = max_balance / 5
-buffer = 80000
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+SYMBOLS         = ["TXRH", "CROX", "PZZA", "CAR" ,"HELE", "JACK", "SHOO"]
+TICK            = 0.01
+LOT_SIZE        = 100
+MAX_LOTS        = 10          # max position per ticker
+CYCLE_SECONDS   = 5          # reprice / check every N seconds
+POLL_INTERVAL   = 0.5        # inner loop resolution
 
-TICK_INTERVAL = 1.0
-midNotLast = True
+# 200 trade minimum push
+TRADE_PUSH_SYMBOL   = "CROX"
+MIN_TRADES          = 200
+TRADE_PUSH_MINUTES  = 30     # start pushing this many minutes before end
 
+# Directional signal: N of last WINDOW trades
+SIGNAL_WINDOW   = 15         # lookback window in trades
+SIGNAL_THRESH   = 10         # need >= THRESH up/down trades to signal
 
-# ─────────────────────────────────────────────────────────────
-# PRINTING HELPERS
-# ─────────────────────────────────────────────────────────────
+LOG_PATH        = "directional_mm_log.csv"
 
-def print_mode_header(mode, current_time):
-    print(f"\n{'=' * 60}")
-    print(f"  {mode}  |  {current_time}")
-    print(f"{'=' * 60}")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
+def ensure_log():
+    if not os.path.exists(LOG_PATH):
+        with open(LOG_PATH, "w", newline="") as f:
+            csv.writer(f).writerow([
+                "wall_time", "sim_time", "symbol", "event",
+                "signal", "side", "price", "pos_lots", "detail",
+            ])
 
-def print_ticker_action(ticker, action, state, bid_quote=None, ask_quote=None, volume=None, signal=None):
-    print(f"\n  [{action}] {ticker}")
-    print(f"    Market:  bid={state['best_bid']:.2f}  ask={state['best_ask']:.2f}  "
-          f"quote={state['quote_price']:.2f}  skew={state['order_book_skew']:.4f}")
-    if signal is not None:
-        print(f"    Signal:  {signal:.4f}")
-    if bid_quote is not None or ask_quote is not None:
-        bid_str = f"{bid_quote:.2f}" if bid_quote and bid_quote != 0 else "OFF"
-        ask_str = f"{ask_quote:.2f}" if ask_quote and not math.isinf(ask_quote) else "OFF"
-        print(f"    Quoting: bid={bid_str}  ask={ask_str}  vol={volume}")
+def log(sim_time, symbol, event, signal="", side="",
+        price="", pos_lots="", detail=""):
+    wall = datetime.now().strftime("%H:%M:%S")
+    with open(LOG_PATH, "a", newline="") as f:
+        csv.writer(f).writerow([
+            wall, sim_time, symbol, event,
+            signal, side, price, pos_lots, detail,
+        ])
+    print(
+        f"[{wall}][{sim_time}][{symbol}] {event:22s} | "
+        f"sig={signal:7s} side={side:4s} "
+        f"px={str(price):8s} pos={str(pos_lots):4s} | {detail}",
+        flush=True
+    )
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def print_portfolio(trader):
-    portfolio = list(trader.get_portfolio_items().values())
-    if len(portfolio) == 0:
-        print("  Portfolio is empty")
-        return
+def round_tick(x):
+    return round(round(x / TICK) * TICK, 2)
 
-    print("  PORTFOLIO SUMMARY")
-    print("  " + "-" * 100)
-    print(f"  {'Ticker':<10}{'Shares':>10}{'Price':>12}{'Exposure':>14}{'Realized P/L':>16}{'Timestamp':>32}")
-    print("  " + "-" * 100)
+def get_pos(trader, symbol):
+    item = trader.get_portfolio_item(symbol)
+    return (int(item.get_long_shares())
+            - int(item.get_short_shares())) // LOT_SIZE
 
-    total_exposure = 0
-    for item in portfolio:
-        shares = item.get_shares()
-        price = item.get_price()
-        realized_pl = item.get_realized_pl()
-        timestamp = item.get_timestamp()
-        exposure = shares * price
-        total_exposure += exposure
-        print(
-            f"  {item.get_symbol():<10}"
-            f"{shares:>10}"
-            f"{price:>12.2f}"
-            f"{exposure:>14.2f}"
-            f"{realized_pl:>16.2f}"
-            f"{str(timestamp):>32}"
-        )
-    print("  " + "-" * 100)
-    print(f"  {'TOTAL':<10}{'':>10}{'':>12}{total_exposure:>14.2f}")
-    print()
+def get_best(trader, symbol):
+    try:
+        bo = trader.get_order_book(symbol, shift.OrderBookType.GLOBAL_BID)
+        ao = trader.get_order_book(symbol, shift.OrderBookType.GLOBAL_ASK)
+        if bo and ao and bo[0].price > 0 and ao[0].price > 0:
+            return float(bo[0].price), float(ao[0].price)
+    except Exception:
+        pass
+    return None, None
 
+def cancel_symbol(trader, symbol):
+    for o in trader.get_waiting_list():
+        if o.symbol == symbol:
+            trader.submit_cancellation(o)
+    time.sleep(1.0)
 
-def print_orders(trader):
-    orders_list = trader.get_submitted_orders()[-30:]
-    if len(orders_list) == 0:
-        print("  No Orders")
-        return
-
-    print("  RECENT ORDERS")
-    print("  " + "-" * 130)
-    print(f"  {'Symbol':<8}{'Type':<22}{'Price':>8}{'Size':>6}{'Exec':>6}  {'Status':<22}{'Timestamp'}")
-    print("  " + "-" * 130)
-    for order in orders_list:
-        price = order.executed_price if order.status == shift.Order.Status.FILLED else order.price
-        print(
-            f"  {order.symbol:<8}"
-            f"{str(order.type):<22}"
-            f"{price:>8.2f}"
-            f"{order.size:>6}"
-            f"{order.executed_size:>6}  "
-            f"{str(order.status):<22}"
-            f"{order.timestamp}"
-        )
-    print("  " + "-" * 130)
-    print()
-
-
-# ─────────────────────────────────────────────────────────────
-# QUOTING & SIGNAL
-# ─────────────────────────────────────────────────────────────
-
-def quote(best_prices, last_trade, mid_price):
-    last_price, last_size = last_trade
-
-    bid = best_prices[0]
-    ask = best_prices[1]
-    bid_price, bid_size = bid
-    ask_price, ask_size = ask
-
-    if last_price * mid_price == 0:
-        return 0
-
-    numerator = last_size * last_price + bid_price * bid_size + ask_price * ask_size
-    denominator = last_size + bid_size + ask_size
-    result = math.floor((numerator / denominator) * 100 + 0.5) / 100
-    return result
-
-
-def marketMakingAggression(current_time, end_time, start_time, skew, inventory):
-    old = False
-    if old:
-        difference = (end_time - start_time).total_seconds() / 60
-        time_left = end_time - current_time
-        minutes_left = max(0, time_left.total_seconds() / 60)
-        signal = minutes_left / difference
-        sigmoidFactor = helper.sigmoid(signal, 3, 1, 2)
-        return sigmoidFactor
+def submit_limit(trader, symbol, side, lots, price,
+                 sim_time, signal, detail=""):
+    if side == "BUY":
+        order = shift.Order(shift.Order.Type.LIMIT_BUY,
+                            symbol, int(lots), float(price))
     else:
-        skew = abs(skew)
-        sigmoidFactor = helper.sigmoidNew(skew, 0.75, 1, 2, 2)
-        return sigmoidFactor
+        order = shift.Order(shift.Order.Type.LIMIT_SELL,
+                            symbol, int(lots), float(price))
+    trader.submit_order(order)
+    log(sim_time, symbol, "SUBMIT", signal, side, price,
+        get_pos(trader, symbol), detail)
+    return order.id
 
+# ---------------------------------------------------------------------------
+# Directional signal tracker
+# ---------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────
-# MARKET MAKING DECISION
-# ─────────────────────────────────────────────────────────────
+class SignalTracker:
+    """
+    Tracks last WINDOW trade events (when last_price changes).
+    Returns BULL / BEAR / NEUTRAL based on direction of each trade.
 
-def marketMakingDecision(trader, current_time, ticker, state, order_log, end_time, start_time):
-    TICK = 0.01
-    quote_price = state['quote_price']
-    best_bid = state["best_bid"]
-    best_ask = state["best_ask"]
-    skew = state["order_book_skew"]
-    volume = state["quantity"]
+    BULL: >= THRESH of last WINDOW trades moved price up
+    BEAR: >= THRESH of last WINDOW trades moved price down
+    NEUTRAL: otherwise
+    """
+    def __init__(self, window=SIGNAL_WINDOW, thresh=SIGNAL_THRESH):
+        self.window    = window
+        self.thresh    = thresh
+        self.directions = deque(maxlen=window)  # +1 up, -1 down
+        self.last_price = None
 
-    if quote_price == 0 or best_bid == 0 or best_ask == 0:
-        return None
+    def update(self, last_price):
+        """
+        Call every tick with current last_price.
+        Returns True if a new trade was detected.
+        """
+        if last_price <= 0:
+            return False
+        if self.last_price is None:
+            self.last_price = last_price
+            return False
+        if last_price == self.last_price:
+            return False   # no new trade
 
-    portfolio_inventory = state['inventory'] or 0
-    signal = marketMakingAggression(current_time, end_time, start_time, skew, portfolio_inventory)
+        direction = 1 if last_price > self.last_price else -1
+        self.directions.append(direction)
+        self.last_price = last_price
+        return True
 
-    maxPos = 1
-    inventory_ratio = portfolio_inventory / maxPos
+    @property
+    def signal(self):
+        if len(self.directions) < self.window:
+            return "NEUTRAL"   # not enough trades yet
+        up   = sum(1 for d in self.directions if d == 1)
+        down = sum(1 for d in self.directions if d == -1)
+        if up >= self.thresh:
+            return "BULL"
+        if down >= self.thresh:
+            return "BEAR"
+        return "NEUTRAL"
 
-    if inventory_ratio > 0:
-        adjusted_signal = signal * 0.8
-        ask_quote = round(math.floor((adjusted_signal * best_ask + (1 - adjusted_signal) * quote_price) / TICK) * TICK, 2)
-        ask_quote = min(ask_quote, best_ask - TICK)
-        bid_quote = 0
-    elif inventory_ratio < 0:
-        adjusted_signal = signal * 0.8
-        bid_quote = round(math.ceil((adjusted_signal * best_bid + (1 - adjusted_signal) * quote_price) / TICK) * TICK, 2)
-        bid_quote = max(bid_quote, best_bid + TICK)
-        ask_quote = float("inf")
+    @property
+    def counts(self):
+        up   = sum(1 for d in self.directions if d == 1)
+        down = sum(1 for d in self.directions if d == -1)
+        return up, down
+
+# ---------------------------------------------------------------------------
+# Quote price computation
+# ---------------------------------------------------------------------------
+
+def compute_quotes(signal, bid, ask):
+    """
+    BULL:    bid + 0.2*spread  /  ask - 0.01   (aggressive bid)
+    BEAR:    bid + 0.01        /  ask - 0.2*spread (aggressive ask)
+    NEUTRAL: bid + 0.02        /  ask - 0.02
+    """
+    spread = ask - bid
+    if signal == "BULL":
+        my_bid = round_tick(bid + 0.2 * spread)
+        my_ask = round_tick(ask - TICK)
+    elif signal == "BEAR":
+        my_bid = round_tick(bid + TICK)
+        my_ask = round_tick(ask - 0.2 * spread)
     else:
-        bid_quote = round(math.ceil((signal * best_bid + (1 - signal) * quote_price) / TICK) * TICK, 2)
-        ask_quote = round(math.floor((signal * best_ask + (1 - signal) * quote_price) / TICK) * TICK, 2)
-        bid_quote = max(bid_quote, best_bid + TICK)
-        ask_quote = min(ask_quote, best_ask - TICK)
+        my_bid = round_tick(bid + 2 * TICK)
+        my_ask = round_tick(ask - 2 * TICK)
+    return my_bid, my_ask
 
-    bid_quote = round(bid_quote, 2)
-    ask_quote = round(ask_quote, 2) if not math.isinf(ask_quote) else ask_quote
+# ---------------------------------------------------------------------------
+# Per-ticker state machine
+# ---------------------------------------------------------------------------
 
-    if bid_quote >= ask_quote:
-        return None
+class TickerMM:
+    """
+    States:
+      QUOTING     — actively quoting both sides (within position limits)
+      AT_MAX      — at max position in signal direction, waiting for signal change
+      LIQUIDATING — signal changed while holding position, selling/buying at mid
+    """
+    QUOTING     = "QUOTING"
+    AT_MAX      = "AT_MAX"
+    LIQUIDATING = "LIQUIDATING"
 
-    bid = (bid_quote, volume)
-    ask = (ask_quote, volume)
-    return bid, ask, signal
+    def __init__(self, symbol):
+        self.symbol      = symbol
+        self.state       = self.QUOTING
+        self.signal      = SignalTracker()
 
+        self.bid_oid     = None
+        self.ask_oid     = None
+        self.liq_oid     = None
+        self.liq_price   = None   # last submitted liq price, to detect mid changes
 
-# ─────────────────────────────────────────────────────────────
-# MARKET MAKING EXECUTION
-# ─────────────────────────────────────────────────────────────
+        self.prev_signal = "NEUTRAL"
+        self.last_cycle  = 0.0
 
-def marketMakingExecution(trader, ticker, bid_side, ask_side, order_log, current_time, inventory=0, offload=False, emergent=False):
-    order_list = trader.get_waiting_list()
+    def _order_done(self, trader, oid):
+        """True if order is no longer resting."""
+        if oid is None:
+            return True
+        waiting_ids = {o.id for o in trader.get_waiting_list()}
+        if oid not in waiting_ids:
+            return True
+        try:
+            o = trader.get_order(oid)
+            if o is None:
+                return True
+            s = str(getattr(o, "status", ""))
+            return "FILLED" in s or "CANCELED" in s or "REJECTED" in s
+        except Exception:
+            return True
 
-    # Cancel existing orders
-    pending = [o for o in trader.get_waiting_list() if o.symbol == ticker]
-    if pending:
-        print(f"    >> CANCELLING {len(pending)} stale order(s)...")
-        max_retries = 10
-        for attempt in range(max_retries):
-            pending = [o for o in trader.get_waiting_list() if o.symbol == ticker]
-            if not pending:
-                print(f"    >> All orders cancelled (attempt {attempt + 1})")
-                break
-            for order in pending:
-                trader.submit_cancellation(order)
-            time.sleep(0.1)
-        else:
-            print(f"    >> WARNING — could not cancel after {max_retries} attempts, skipping")
+    def tick(self, trader, sim_time):
+        now = time.time()
+        if now - self.last_cycle < CYCLE_SECONDS:
+            # Still update signal tracker every poll even outside cycle
+            try:
+                lp = float(trader.get_last_price(self.symbol) or 0)
+                self.signal.update(lp)
+            except Exception:
+                pass
+            return
+        self.last_cycle = now
+
+        # ── Update signal ─────────────────────────────────────────────────
+        try:
+            lp = float(trader.get_last_price(self.symbol) or 0)
+            self.signal.update(lp)
+        except Exception:
+            lp = 0
+
+        current_signal = self.signal.signal
+        up, down       = self.signal.counts
+        pos            = get_pos(trader, self.symbol)
+        bid, ask       = get_best(trader, self.symbol)
+
+        if bid is None or ask is None or bid >= ask:
+            log(sim_time, self.symbol, "NO_BOOK",
+                current_signal, detail=f"up={up} dn={down}")
             return
 
-    bid_price, bid_size = bid_side
-    ask_price, ask_size = ask_side
+        mid    = round_tick((bid + ask) / 2)
+        spread = ask - bid
 
-    if offload:
-        if inventory > 0:
-            if not math.isinf(ask_price):
-                helper.submit_limit_order(trader, ticker, "sell", ask_size, ask_price)
-                order_log.append({
-                    "submit_time": current_time, "ticker": ticker,
-                    "side": "sell", "price": ask_price, "size": ask_size, "status": "submitted"
-                })
-                print(f"    >> SUBMITTED SELL {ask_size} @ {ask_price:.2f} (offload long, inv={inventory})")
+        signal_changed = (current_signal != self.prev_signal)
+        if signal_changed:
+            log(sim_time, self.symbol, "SIGNAL_CHANGE",
+                current_signal,
+                detail=f"{self.prev_signal} → {current_signal} "
+                       f"up={up} dn={down} pos={pos:+d}L")
+
+        # ── State: LIQUIDATING ────────────────────────────────────────────
+        if self.state == self.LIQUIDATING:
+            if pos == 0:
+                log(sim_time, self.symbol, "LIQ_COMPLETE",
+                    current_signal, pos_lots=0,
+                    detail="flat → QUOTING")
+                cancel_symbol(trader, self.symbol)
+                self.liq_oid    = None
+                self.liq_price  = None
+                self.state      = self.QUOTING
+                self.prev_signal = current_signal
+                return
+
+            close_side = "SELL" if pos > 0 else "BUY"
+
+            # Only reprice if mid has moved
+            if self.liq_price == mid:
+                log(sim_time, self.symbol, "LIQ_HOLD",
+                    current_signal, close_side, mid, pos,
+                    detail="mid unchanged, holding")
+                self.prev_signal = current_signal
+                return
+
+            cancel_symbol(trader, self.symbol)
+            self.liq_oid = submit_limit(
+                trader, self.symbol, close_side, abs(pos), mid,
+                sim_time, current_signal,
+                f"LIQ_MID mid={mid}"
+            )
+            self.liq_price = mid
+            self.prev_signal = current_signal
+            return
+
+        # ── State: AT_MAX ─────────────────────────────────────────────────
+        if self.state == self.AT_MAX:
+            # Check if signal changed — if so, liquidate
+            if signal_changed:
+                log(sim_time, self.symbol, "AT_MAX_EXIT",
+                    current_signal, pos_lots=pos,
+                    detail=f"signal changed → liquidating")
+                cancel_symbol(trader, self.symbol)
+                self.bid_oid = None
+                self.ask_oid = None
+                self.state   = self.LIQUIDATING
+                self.liq_price = None
+                self.prev_signal = current_signal
+                return
+
+            log(sim_time, self.symbol, "AT_MAX_WAIT",
+                current_signal, pos_lots=pos,
+                detail=f"holding at max {MAX_LOTS}L "
+                       f"up={up} dn={down}")
+            self.prev_signal = current_signal
+            return
+
+        # ── State: QUOTING ────────────────────────────────────────────────
+
+        # Check if signal changed while holding a position → liquidate
+        if signal_changed and pos != 0:
+            log(sim_time, self.symbol, "SIGNAL_LIQ",
+                current_signal, pos_lots=pos,
+                detail=f"signal changed with pos={pos:+d}L → liquidating")
+            cancel_symbol(trader, self.symbol)
+            self.bid_oid = None
+            self.ask_oid = None
+            self.state   = self.LIQUIDATING
+            self.liq_price = None
+            self.prev_signal = current_signal
+            return
+
+        # Check position limits
+        if current_signal == "BULL" and pos >= MAX_LOTS:
+            log(sim_time, self.symbol, "AT_MAX",
+                current_signal, pos_lots=pos,
+                detail=f"long {pos}L >= MAX {MAX_LOTS}L → waiting")
+            cancel_symbol(trader, self.symbol)
+            self.bid_oid = None
+            self.ask_oid = None
+            self.state   = self.AT_MAX
+            self.prev_signal = current_signal
+            return
+
+        if current_signal == "BEAR" and pos <= -MAX_LOTS:
+            log(sim_time, self.symbol, "AT_MAX",
+                current_signal, pos_lots=pos,
+                detail=f"short {pos}L <= -MAX {MAX_LOTS}L → waiting")
+            cancel_symbol(trader, self.symbol)
+            self.bid_oid = None
+            self.ask_oid = None
+            self.state   = self.AT_MAX
+            self.prev_signal = current_signal
+            return
+
+        # Compute quotes based on signal
+        my_bid, my_ask = compute_quotes(current_signal, bid, ask)
+
+        if my_bid >= my_ask:
+            log(sim_time, self.symbol, "SPREAD_TIGHT",
+                current_signal, detail=f"spread={spread:.4f} < min")
+            self.prev_signal = current_signal
+            return
+
+        # Reprice — cancel and resubmit both sides
+        cancel_symbol(trader, self.symbol)
+
+        self.bid_oid = submit_limit(
+            trader, self.symbol, "BUY", 1, my_bid,
+            sim_time, current_signal,
+            f"up={up} dn={down} spread={spread:.4f}"
+        )
+        self.ask_oid = submit_limit(
+            trader, self.symbol, "SELL", 1, my_ask,
+            sim_time, current_signal,
+            f"up={up} dn={down} spread={spread:.4f}"
+        )
+
+        log(sim_time, self.symbol, "QUOTED",
+            current_signal, pos_lots=pos,
+            detail=f"BUY@{my_bid} SELL@{my_ask} "
+                   f"up={up} dn={down}")
+
+        self.prev_signal = current_signal
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def get_executed_count(trader):
+    """Count unique filled execution records across all submitted orders."""
+    count = 0
+    seen  = set()
+    for order in trader.get_submitted_orders():
+        s = str(getattr(order, "status", ""))
+        if "FILLED" in s or "PARTIALLY" in s:
+            oid = str(order.id)
+            if oid not in seen:
+                seen.add(oid)
+                count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run(trader, end_time):
+    ensure_log()
+    machines = {sym: TickerMM(sym) for sym in SYMBOLS}
+
+    push_start    = end_time - timedelta(minutes=TRADE_PUSH_MINUTES)
+    push_last     = 0.0        # wall time of last push cycle
+    push_bid_oid  = None
+    push_ask_oid  = None
+
+    print(f"[MM] Starting | tickers={SYMBOLS} | end={end_time}",
+          flush=True)
+
+    while trader.get_last_trade_time() < end_time:
+        sim_time = trader.get_last_trade_time()
+
+        # ── 200 trade push — fires in last TRADE_PUSH_MINUTES ────────────
+        if sim_time >= push_start:
+            n_exec = get_executed_count(trader)
+            if n_exec < MIN_TRADES:
+                now = time.time()
+                if now - push_last >= CYCLE_SECONDS:
+                    push_last = now
+                    needed = MIN_TRADES - n_exec
+                    print(f"[TRADE PUSH] {n_exec}/{MIN_TRADES} — "
+                          f"need {needed} more | submitting BUY+SELL "
+                          f"at mid on {TRADE_PUSH_SYMBOL}", flush=True)
+
+                    bid, ask = get_best(trader, TRADE_PUSH_SYMBOL)
+                    if bid and ask:
+                        mid = round_tick((bid + ask) / 2)
+
+                        # Cancel previous push orders if still resting
+                        for oid in [push_bid_oid, push_ask_oid]:
+                            if oid is not None:
+                                for o in trader.get_waiting_list():
+                                    if o.id == oid:
+                                        trader.submit_cancellation(o)
+                        time.sleep(0.5)
+
+                        # Submit fresh mid buy + mid sell
+                        buy_order = shift.Order(
+                            shift.Order.Type.LIMIT_BUY,
+                            TRADE_PUSH_SYMBOL, 1, float(mid))
+                        sell_order = shift.Order(
+                            shift.Order.Type.LIMIT_SELL,
+                            TRADE_PUSH_SYMBOL, 1, float(mid))
+                        trader.submit_order(buy_order)
+                        trader.submit_order(sell_order)
+                        push_bid_oid = buy_order.id
+                        push_ask_oid = sell_order.id
+                        print(f"[TRADE PUSH] BUY 1L @ {mid} | "
+                              f"SELL 1L @ {mid}", flush=True)
             else:
-                print(f"    >> SELL side OFF (offload long)")
-        elif inventory < 0:
-            if bid_price != 0:
-                helper.submit_limit_order(trader, ticker, "buy", bid_size, bid_price)
-                order_log.append({
-                    "submit_time": current_time, "ticker": ticker,
-                    "side": "buy", "price": bid_price, "size": bid_size, "status": "submitted"
-                })
-                print(f"    >> SUBMITTED BUY {bid_size} @ {bid_price:.2f} (offload short, inv={inventory})")
-            else:
-                print(f"    >> BUY side OFF (offload short)")
-    else:
-        if bid_price != 0:
-            helper.submit_limit_order(trader, ticker, "buy", bid_size, bid_price)
-            order_log.append({
-                "submit_time": current_time, "ticker": ticker,
-                "side": "buy", "price": bid_price, "size": bid_size, "status": "submitted"
-            })
-            print(f"    >> SUBMITTED BUY  {bid_size} @ {bid_price:.2f}")
-        else:
-            print(f"    >> BUY side OFF (long inventory)")
-
-        if not math.isinf(ask_price):
-            helper.submit_limit_order(trader, ticker, "sell", ask_size, ask_price)
-            order_log.append({
-                "submit_time": current_time, "ticker": ticker,
-                "side": "sell", "price": ask_price, "size": ask_size, "status": "submitted"
-            })
-            print(f"    >> SUBMITTED SELL {ask_size} @ {ask_price:.2f}")
-        else:
-            print(f"    >> SELL side OFF (short inventory)")
-
-
-# ─────────────────────────────────────────────────────────────
-# EMERGENT MARKET MAKING
-# ─────────────────────────────────────────────────────────────
-
-def emergentMarketMaking(trader, current_time, end_time, number):
-    threshold = 10
-    if end_time - current_time <= dt.timedelta(minutes=threshold):
-        tradeCount = helper.tradeCount(trader)
-        if tradeCount < number:
-            print(f"  Trades: {tradeCount}/{number} — need {number - tradeCount} more!")
-            return True
-        else:
-            print(f"  Trades: {tradeCount}/{number} — target reached!")
-            return False
-    else:
-        return False
-
-
-def emergentMarketMakingDecision(trader, number, ticker, state):
-    TICK = 0.01
-    quote_price = state['quote_price']
-    best_bid = state["best_bid"]
-    best_ask = state["best_ask"]
-    volume = state["quantity"]
-
-    if quote_price == 0 or best_bid == 0 or best_ask == 0:
-        return None
-
-    bid_quote = round(quote_price - 2 * TICK, 2)
-    ask_quote = round(quote_price + 2 * TICK, 2)
-
-    bid = (bid_quote, volume)
-    ask = (ask_quote, volume)
-    return bid, ask, 0.0
-
-
-# ─────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def merge_orders(orders1, orders2, descending=True):
-    combined = defaultdict(int)
-    for o in orders1 + orders2:
-        combined[o.price] += o.size
-    return sorted(combined.items(), key=lambda x: x[0], reverse=descending)
-
-
-def precise_sleep(interval):
-    if interval > 0:
-        time.sleep(interval)
-
-
-# ─────────────────────────────────────────────────────────────
-# PROCESS TICKER
-# ─────────────────────────────────────────────────────────────
-
-def process_ticker(trader, ticker, state, order_log, current_time, fixed_end, fixed_start,
-                   action, inventory=0, emergent=False, trade=True):
-    if action == "EMERGENT MM":
-        result = emergentMarketMakingDecision(trader, 200, ticker, state)
-    else:
-        result = marketMakingDecision(trader, current_time, ticker, state, order_log, fixed_end, fixed_start)
-
-    if result is None:
-        print(f"\n  [{action} — SKIPPED] {ticker}  (no data or crossed quotes)")
-        state['submitted_ask_price'].append(0)
-        state['submitted_bid_price'].append(0)
-        return
-
-    bid_side, ask_side, signal = result
-    print_ticker_action(ticker, action, state, bid_side[0], ask_side[0], bid_side[1], signal)
-
-    state['submitted_ask_price'].append(ask_side[0])
-    state['submitted_bid_price'].append(bid_side[0])
-
-    offload = (action == "LIQUIDATING")
-
-    if trade:
-        marketMakingExecution(trader, ticker, bid_side, ask_side, order_log, current_time,
-                              inventory=inventory, offload=offload, emergent=emergent)
-    else:
-        print(f"    Trade on cooldown, please wait")
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
-
-def main():
-    trader = shift.Trader(TRADER_ID)
-    connected = False
-    try:
-        trader.connect(CFG_FILE, PASSWORD)
-        connected = True
-    except Exception as e:
-        print(f"Connection failed: {e}")
-        return
-
-    ticker_list = trader.get_stock_list()
-    numberOfTrade = len(ticker_list)
-    trader.sub_all_order_book()
-    stock_list = {}
-    order_log = []
-    counter = 0
-
-    while counter < 10:
-        print("Initialization Protocol")
-        current_time = trader.get_last_trade_time()
-        current_time = current_time.replace(microsecond=0)
-        print(f"Current time is {current_time}")
-        counter += 1
-        time.sleep(1)
-
-    print("Initialization Complete")
-    last_trade_time = trader.get_last_trade_time()
-    sim_date = last_trade_time.date()
-    start_time = last_trade_time.time()
-    real_start = time.perf_counter()
-
-    testTime = dt.time(hour=16, minute=00)
-    end_time = dt.datetime.combine(sim_date, testTime)
-
-    current_time = dt.datetime.combine(sim_date, start_time)
-    last_time = current_time
-
-    fixed_start = current_time
-    fixed_end = end_time
-
-    print(f"Simulation starts at: {fixed_start}")
-    print(f"Simulation ends at:   {fixed_end}")
-    print()
-
-    # ── Per-ticker cooldown tracking ──
-    COOLDOWN_SECONDS = 30
-    last_trade_dates = {t: current_time - dt.timedelta(seconds=COOLDOWN_SECONDS + 1) for t in ticker_list}
-
-    try:
-        while True:
-            tick = time.perf_counter()
-            elapsed = tick - real_start
-            current_time = dt.datetime.combine(sim_date, start_time) + dt.timedelta(seconds=elapsed)
-            current_time = current_time.replace(microsecond=0)
-
-            if current_time != last_time:
-                last_time = current_time
-                print("\n" + "*" * 60)
-                print(f"  {current_time}")
-                print("*" * 60)
-
-                print_orders(trader)
-
-                # ── Update state for all tickers ──
-                for ticker in ticker_list:
-                    if ticker not in stock_list:
-                        stock_list[ticker] = {
-                            "time": current_time,
-                            "times": [],
-                            "last_prices": [],
-                            "last_price": 0,
-                            "mid_prices": [],
-                            "mid_price": 0,
-                            "quote_prices": [],
-                            "quote_price": 0,
-                            "order_book_skews": [],
-                            "order_book_skew": 0,
-                            "best_bid": 0,
-                            "best_bids": [],
-                            "best_ask": 0,
-                            "best_asks": [],
-                            "quantity": 1,
-                            "submitted_ask_price": [],
-                            "submitted_bid_price": [],
-                            "inventories": [],
-                            "inventory": 0,
-                            "actions": [],
-                        }
-
-                    state = stock_list[ticker]
-
-                    try:
-                        bid_orders = trader.get_order_book(ticker, shift.OrderBookType.GLOBAL_BID) or []
-                        ask_orders = trader.get_order_book(ticker, shift.OrderBookType.GLOBAL_ASK) or []
-                    except Exception as e:
-                        print(f"  Order book unavailable for {ticker}: {e}")
-                        break
-
-                    l_bid_orders = []
-                    l_ask_orders = []
-
-                    bid_levels = merge_orders(bid_orders, l_bid_orders, descending=True)
-                    ask_levels = merge_orders(ask_orders, l_ask_orders, descending=False)
-
-                    bid_prices, bid_volumes = map(list, zip(*bid_levels)) if bid_levels else ([], [])
-                    ask_prices, ask_volumes = map(list, zip(*ask_levels)) if ask_levels else ([], [])
-
-                    last_price = trader.get_last_price(ticker) or 0
-                    last_size = trader.get_last_size(ticker) or 0
-                    last_trade = (last_price, last_size)
-
-                    best_bid = max(bid_orders + l_bid_orders, key=lambda o: o.price, default=None)
-                    best_ask = min(ask_orders + l_ask_orders, key=lambda o: o.price, default=None)
-
-                    if best_bid and best_ask:
-                        best_bid_price = best_bid.price
-                        best_bid_size = best_bid.size
-                        best_ask_price = best_ask.price
-                        best_ask_size = best_ask.size
-                    else:
-                        best_bid_price = 0
-                        best_bid_size = 0
-                        best_ask_price = 0
-                        best_ask_size = 0
-
-                    best_prices = [(best_bid_price, best_bid_size), (best_ask_price, best_ask_size)]
-
-                    if best_bid_price == 0 or best_ask_price == 0:
-                        mid_price = 0
-                    else:
-                        mid_price = (best_bid_price + best_ask_price) / 2
-
-                    if midNotLast:
-                        ask_score = helper.bookAnalysisScore(np.array(ask_prices), np.array(ask_volumes), mid_price) or 0
-                        bid_score = helper.bookAnalysisScore(np.array(bid_prices), np.array(bid_volumes), mid_price) or 0
-                    else:
-                        ask_score = helper.bookAnalysisScore(np.array(ask_prices), np.array(ask_volumes), last_price) or 0
-                        bid_score = helper.bookAnalysisScore(np.array(bid_prices), np.array(bid_volumes), last_price) or 0
-
-                    if bid_score == 0:
-                        skew = -float('inf') if ask_score != 0 else 0
-                    elif ask_score == 0:
-                        skew = float("inf")
-                    elif bid_score > ask_score:
-                        skew = bid_score / ask_score
-                    else:
-                        skew = -ask_score / bid_score
-
-                    if not math.isinf(skew):
-                        quote_price = quote(best_prices, last_trade, mid_price)
-                    else:
-                        quote_price = 0
-
-                    state['time'] = current_time
-                    state["times"].append(current_time)
-                    state['last_prices'].append(last_price)
-                    state['last_price'] = last_price
-                    state['mid_prices'].append(mid_price)
-                    state['mid_price'] = mid_price
-                    state['quote_prices'].append(quote_price)
-                    state['quote_price'] = quote_price
-
-                    skew_to_save = 0 if math.isinf(skew) else skew
-                    state['order_book_skews'].append(skew_to_save)
-                    state['order_book_skew'] = skew_to_save
-
-                    state["best_bid"] = best_bid_price
-                    state["best_ask"] = best_ask_price
-                    state['best_bids'].append(best_bid_price)
-                    state['best_asks'].append(best_ask_price)
-
-                    item = trader.get_portfolio_item(ticker)
-                    position = item.get_shares()
-                    state["inventories"].append(position)
-                    state["inventory"] = position
-
-                # ── Trading Logic ──
-                checker = emergentMarketMaking(trader, current_time, fixed_end, 200)
-
-                if checker:
-                    print_mode_header("EMERGENT MODE", current_time)
-                else:
-                    print_mode_header("NORMAL MODE", current_time)
-
-                for ticker in stock_list:
-                    state = stock_list[ticker]
-
-                    # Per-ticker cooldown check
-                    cooldown_ok = (current_time - last_trade_dates[ticker]) >= dt.timedelta(seconds=COOLDOWN_SECONDS)
-
-                    if checker:
-                        state['actions'].append("EMERGENT MM")
-                        if cooldown_ok:
-                            process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="EMERGENT MM", emergent=True, trade=True)
-                            last_trade_dates[ticker] = current_time
-                        else:
-                            process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="EMERGENT MM", emergent=True, trade=False)
-                    else:
-                        state['actions'].append("MARKET MAKING")
-                        if cooldown_ok:
-                            process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="MARKET MAKING", emergent=False, trade=True)
-                            last_trade_dates[ticker] = current_time
-                        else:
-                            process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="MARKET MAKING", emergent=False, trade=False)
-
-            tick_duration = time.perf_counter() - tick
-            precise_sleep(max(0.0, TICK_INTERVAL - tick_duration))
-
-    except KeyboardInterrupt:
-        print("\n\nStopping....")
-    finally:
-        os.makedirs("tickers_data", exist_ok=True)
-
-        if order_log:
-            order_df = pd.DataFrame(order_log)
-            order_df.to_excel("tickers_data/order_log.xlsx", index=False)
-            print("Exported order log")
-
-        all_frames = []
-        for ticker, state in stock_list.items():
-            n = min(len(state['times']), len(state['actions']), len(state['last_prices']),
-                    len(state['mid_prices']), len(state['quote_prices']), len(state['order_book_skews']),
-                    len(state['best_asks']), len(state['best_bids']),
-                    len(state['submitted_ask_price']), len(state['submitted_bid_price']),
-                    len(state['inventories']))
-            df = pd.DataFrame({
-                "ticker": ticker,
-                "time": state['times'][:n],
-                "action": state['actions'][:n],
-                "last_price": state['last_prices'][:n],
-                "mid_price": state['mid_prices'][:n],
-                "quote_price": state['quote_prices'][:n],
-                "order_book_skew": state['order_book_skews'][:n],
-                "best_ask": state["best_asks"][:n],
-                "best_bid": state["best_bids"][:n],
-                "submitted_ask": state["submitted_ask_price"][:n],
-                "submitted_bid": state["submitted_bid_price"][:n],
-                "inventories": state["inventories"][:n],
-            })
-            all_frames.append(df)
-
-        if all_frames:
-            combined = pd.concat(all_frames, ignore_index=True)
-            combined = combined.sort_values(["time", "ticker"]).set_index("time")
-            combined.to_excel("tickers_data/all_tickers.xlsx")
-            print("Exported all_tickers.xlsx")
-
-        if connected:
+                print(f"[TRADE PUSH] {n_exec}/{MIN_TRADES} — "
+                      f"target reached!", flush=True)
+
+        # ── Normal market making ──────────────────────────────────────────
+        for sym, mm in machines.items():
             try:
-                trader.disconnect()
-                print("Disconnected.")
+                mm.tick(trader, sim_time)
             except Exception as e:
-                print(f"Disconnect failed: {e}")
+                print(f"[ERROR][{sym}] {e}", flush=True)
 
+        time.sleep(POLL_INTERVAL)
+
+    # Shutdown
+    print("[MM] Session ending — cancelling all and flattening",
+          flush=True)
+    for sym in SYMBOLS:
+        cancel_symbol(trader, sym)
+        pos = get_pos(trader, sym)
+        if pos != 0:
+            side = "SELL" if pos > 0 else "BUY"
+            order = (
+                shift.Order(shift.Order.Type.MARKET_SELL, sym, abs(pos))
+                if side == "SELL"
+                else shift.Order(shift.Order.Type.MARKET_BUY, sym, abs(pos))
+            )
+            trader.submit_order(order)
+            print(f"[SHUTDOWN] {side} {abs(pos)}L {sym} at market",
+                  flush=True)
+            time.sleep(1.0)
+
+    print("[MM] Done.", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    with shift.Trader("columbia-traders") as trader:
+        trader.connect("initiator.cfg", "aRkkZSrj")
+        time.sleep(1.0)
+        trader.sub_all_order_book()
+        time.sleep(1.0)
+        end_time = (trader.get_last_trade_time()
+                    + timedelta(minutes=380.0))
+        try:
+            run(trader, end_time)
+        except KeyboardInterrupt:
+            for sym in SYMBOLS:
+                cancel_symbol(trader, sym)
+            trader.disconnect()

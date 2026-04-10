@@ -364,7 +364,7 @@ def main():
         return
     
     print("Sleep 1 minute to let the time be updated")
-    time.sleep(60) 
+    time.sleep(10) 
    
 
     ticker_list = trader.get_stock_list()
