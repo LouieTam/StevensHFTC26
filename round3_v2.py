@@ -9,7 +9,6 @@ import math
 import bisect
 from collections import defaultdict
 import os
-#round 3 MM
 
 # Constants
 TRADER_ID = "columbia-traders"
