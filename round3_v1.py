@@ -9,7 +9,6 @@ import math
 import bisect
 from collections import defaultdict
 import os
-#round 3 MM
 
 # Constants
 TRADER_ID = "columbia-traders"
@@ -78,7 +77,7 @@ def print_portfolio(trader):
 
 
 def print_orders(trader):
-    orders_list = trader.get_submitted_orders()[-30:]
+    orders_list = trader.get_submitted_orders()[-10:]
     if len(orders_list) == 0:
         print("  No Orders")
         return
@@ -156,7 +155,7 @@ def marketMakingDecision(trader, current_time, ticker, state, order_log, end_tim
     portfolio_inventory = state['inventory'] or 0
     signal = marketMakingAggression(current_time, end_time, start_time, skew, portfolio_inventory)
 
-    maxPos = 1
+    maxPos = 3
     inventory_ratio = portfolio_inventory / maxPos
 
     if inventory_ratio > 0:
@@ -193,6 +192,20 @@ def marketMakingDecision(trader, current_time, ticker, state, order_log, end_tim
 def marketMakingExecution(trader, ticker, bid_side, ask_side, order_log, current_time, inventory=0, offload=False, emergent=False):
     order_list = trader.get_waiting_list()
 
+    if emergent:
+        staleThreshold = 10
+    elif offload:
+        staleThreshold = 15
+    else:
+        staleThreshold = 30
+
+    for order in order_list:
+        if order.symbol == ticker:
+            age = (dt.datetime.now() - order.timestamp).total_seconds()
+            if age < staleThreshold:
+                print(f"    >> WAITING (order age {age:.0f}s < {staleThreshold}s threshold)")
+                return
+
     # Cancel existing orders
     pending = [o for o in trader.get_waiting_list() if o.symbol == ticker]
     if pending:
@@ -205,7 +218,7 @@ def marketMakingExecution(trader, ticker, bid_side, ask_side, order_log, current
                 break
             for order in pending:
                 trader.submit_cancellation(order)
-            time.sleep(0.1)
+            time.sleep(0.5)
         else:
             print(f"    >> WARNING — could not cancel after {max_retries} attempts, skipping")
             return
@@ -313,7 +326,7 @@ def precise_sleep(interval):
 # ─────────────────────────────────────────────────────────────
 
 def process_ticker(trader, ticker, state, order_log, current_time, fixed_end, fixed_start,
-                   action, inventory=0, emergent=False, trade=True):
+                   action, inventory=0, emergent=False):
     if action == "EMERGENT MM":
         result = emergentMarketMakingDecision(trader, 200, ticker, state)
     else:
@@ -328,16 +341,12 @@ def process_ticker(trader, ticker, state, order_log, current_time, fixed_end, fi
     bid_side, ask_side, signal = result
     print_ticker_action(ticker, action, state, bid_side[0], ask_side[0], bid_side[1], signal)
 
+    offload = (action == "LIQUIDATING")
+    marketMakingExecution(trader, ticker, bid_side, ask_side, order_log, current_time,
+                          inventory=inventory, offload=offload, emergent=emergent)
+
     state['submitted_ask_price'].append(ask_side[0])
     state['submitted_bid_price'].append(bid_side[0])
-
-    offload = (action == "LIQUIDATING")
-
-    if trade:
-        marketMakingExecution(trader, ticker, bid_side, ask_side, order_log, current_time,
-                              inventory=inventory, offload=offload, emergent=emergent)
-    else:
-        print(f"    Trade on cooldown, please wait")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -353,6 +362,10 @@ def main():
     except Exception as e:
         print(f"Connection failed: {e}")
         return
+    
+    print("Sleep 1 minute to let the time be updated")
+    time.sleep(60) 
+   
 
     ticker_list = trader.get_stock_list()
     numberOfTrade = len(ticker_list)
@@ -361,7 +374,7 @@ def main():
     order_log = []
     counter = 0
 
-    while counter < 10:
+    while counter < 5:
         print("Initialization Protocol")
         current_time = trader.get_last_trade_time()
         current_time = current_time.replace(microsecond=0)
@@ -387,10 +400,6 @@ def main():
     print(f"Simulation starts at: {fixed_start}")
     print(f"Simulation ends at:   {fixed_end}")
     print()
-
-    # ── Per-ticker cooldown tracking ──
-    COOLDOWN_SECONDS = 30
-    last_trade_dates = {t: current_time - dt.timedelta(seconds=COOLDOWN_SECONDS + 1) for t in ticker_list}
 
     try:
         while True:
@@ -525,33 +534,36 @@ def main():
 
                 if checker:
                     print_mode_header("EMERGENT MODE", current_time)
+                    candidates = sorted(stock_list.keys(),
+                                        key=lambda x: abs(stock_list[x]['order_book_skew']))[:numberOfTrade]
                 else:
                     print_mode_header("NORMAL MODE", current_time)
+                    candidates = sorted(stock_list.keys(),
+                                        key=lambda x: abs(stock_list[x]['order_book_skew']))[:numberOfTrade]
 
                 for ticker in stock_list:
                     state = stock_list[ticker]
 
-                    # Per-ticker cooldown check
-                    cooldown_ok = (current_time - last_trade_dates[ticker]) >= dt.timedelta(seconds=COOLDOWN_SECONDS)
-
-                    if checker:
-                        state['actions'].append("EMERGENT MM")
-                        if cooldown_ok:
+                    if ticker in candidates:
+                        if checker:
+                            state['actions'].append("EMERGENT MM")
                             process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="EMERGENT MM", emergent=True, trade=True)
-                            last_trade_dates[ticker] = current_time
+                                           fixed_end, fixed_start, action="EMERGENT MM", emergent=True)
                         else:
+                            state['actions'].append("MARKET MAKING")
                             process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="EMERGENT MM", emergent=True, trade=False)
+                                           fixed_end, fixed_start, action="MARKET MAKING")
                     else:
-                        state['actions'].append("MARKET MAKING")
-                        if cooldown_ok:
-                            process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="MARKET MAKING", emergent=False, trade=True)
-                            last_trade_dates[ticker] = current_time
+                        inventory = state['inventory']
+                        if inventory == 0:
+                            state['actions'].append("IDLE")
+                            state['submitted_ask_price'].append(0)
+                            state['submitted_bid_price'].append(0)
                         else:
+                            state['actions'].append("LIQUIDATING")
                             process_ticker(trader, ticker, state, order_log, current_time,
-                                           fixed_end, fixed_start, action="MARKET MAKING", emergent=False, trade=False)
+                                           fixed_end, fixed_start, action="LIQUIDATING",
+                                           inventory=inventory)
 
             tick_duration = time.perf_counter() - tick
             precise_sleep(max(0.0, TICK_INTERVAL - tick_duration))
@@ -568,11 +580,7 @@ def main():
 
         all_frames = []
         for ticker, state in stock_list.items():
-            n = min(len(state['times']), len(state['actions']), len(state['last_prices']),
-                    len(state['mid_prices']), len(state['quote_prices']), len(state['order_book_skews']),
-                    len(state['best_asks']), len(state['best_bids']),
-                    len(state['submitted_ask_price']), len(state['submitted_bid_price']),
-                    len(state['inventories']))
+            n = len(state['times'])
             df = pd.DataFrame({
                 "ticker": ticker,
                 "time": state['times'][:n],
