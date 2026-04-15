@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-SYMBOLS         = ["TXRH", "CROX", "PZZA", "CAR" ,"HELE", "JACK", "SHOO"]
+SYMBOLS         = ["CS2", "CS1",]
 TICK            = 0.01
 LOT_SIZE        = 100
 MAX_LOTS        = 10          # max position per ticker
@@ -62,8 +62,8 @@ def get_pos(trader, symbol):
 
 def get_best(trader, symbol):
     try:
-        bo = trader.get_order_book(symbol, shift.OrderBookType.GLOBAL_BID)
-        ao = trader.get_order_book(symbol, shift.OrderBookType.GLOBAL_ASK)
+        bo = trader.get_order_book(symbol, shift.OrderBookType.LOCAL_BID)
+        ao = trader.get_order_book(symbol, shift.OrderBookType.LOCAL_ASK)
         if bo and ao and bo[0].price > 0 and ao[0].price > 0:
             return float(bo[0].price), float(ao[0].price)
     except Exception:
