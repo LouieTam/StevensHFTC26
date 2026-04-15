@@ -155,7 +155,7 @@ def marketMakingDecision(trader, current_time, ticker, state, order_log, end_tim
     portfolio_inventory = state['inventory'] or 0
     signal = marketMakingAggression(current_time, end_time, start_time, skew, portfolio_inventory)
 
-    maxPos = 1
+    maxPos = 10
     inventory_ratio = portfolio_inventory / maxPos
 
     if inventory_ratio > 0:
@@ -435,8 +435,8 @@ def main():
                     state = stock_list[ticker]
 
                     try:
-                        bid_orders = trader.get_order_book(ticker, shift.OrderBookType.GLOBAL_BID) or []
-                        ask_orders = trader.get_order_book(ticker, shift.OrderBookType.GLOBAL_ASK) or []
+                        bid_orders = trader.get_order_book(ticker, shift.OrderBookType.LOCAL_BID) or []
+                        ask_orders = trader.get_order_book(ticker, shift.OrderBookType.LOCAL_ASK) or []
                     except Exception as e:
                         print(f"  Order book unavailable for {ticker}: {e}")
                         break
