@@ -3,7 +3,6 @@ import time
 import csv
 import os
 from datetime import datetime, timedelta
-#Round 4 MM
 
 # ---------------------------------------------------------------------------
 # CONFIG

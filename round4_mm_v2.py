@@ -3,21 +3,18 @@ import time
 import csv
 import os
 from datetime import datetime, timedelta
-#Round 4 MM
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-SYMBOLS            = ["CS1", "CS2", "CS3"]
-TICK               = 0.01
-LOT_SIZE           = 100
-QUOTE_LOTS         = 3            # lots per side
-MIN_SPREAD         = 0.04         # only quote when spread >= this
-CYCLE_SECONDS      = 2            # reprice cycle
-POLL_INTERVAL      = 0.2          # inner loop resolution
-PNL_INTERVAL       = 1            # log PnL every N seconds
-MAX_POSITION_LOTS  = 40           # inventory skew reference — tune this
-SKEW_MULT          = 0.2          # fraction of spread to skew per unit inv_ratio
+SYMBOLS         = ["CS1", "CS2", "CS3"]
+TICK            = 0.01
+LOT_SIZE        = 100
+QUOTE_LOTS      = 3            # lots per side
+MIN_SPREAD      = 0.04         # only quote when spread >= this
+CYCLE_SECONDS   = 2            # reprice cycle
+POLL_INTERVAL   = 0.2          # inner loop resolution
+PNL_INTERVAL    = 1            # log PnL every N seconds
 
 LOG_PATH     = "zi_mm_log_run6.csv"
 PNL_LOG_PATH = "zi_mm_pnl_run6.csv"
@@ -110,51 +107,17 @@ def cancel_order(trader, order):
     except Exception as e:
         print(f"[CANCEL ERROR] {e}", flush=True)
 
-def compute_skewed_quotes(best_bid, best_ask, pos_lots):
-    """
-    Inventory-aware quote generation.
-    Baseline:    bid+1tick, ask-1tick (1 tick inside the book)
-    Skew:        shift BOTH quotes by (inv_ratio * spread * SKEW_MULT)
-                 where inv_ratio = pos_lots / MAX_POSITION_LOTS, clipped to [-1, 1]
-    Long  (pos>0) → skew > 0 → both quotes shift DOWN:
-        - our bid gets less aggressive (buyers less likely to hit us)
-        - our ask gets more aggressive (more likely to offload inventory)
-    Short (pos<0) → skew < 0 → both quotes shift UP (symmetric).
-    Quotes can intentionally sit outside the best bid/ask when skew is large —
-    this is expected behavior for deep inventory.
-    Returns (my_bid, my_ask, skew, inv_ratio), or (None, None, skew, inv_ratio)
-    if skewed quotes cross each other.
-    """
-    spread    = best_ask - best_bid
-    inv_ratio = max(-1.0, min(1.0, pos_lots / MAX_POSITION_LOTS))
-    skew      = inv_ratio * spread * SKEW_MULT
-
-    my_bid = round_tick((best_bid + TICK) - skew)
-    my_ask = round_tick((best_ask - TICK) - skew)
-
-    # Safety: prevent crossing the market
-    if my_bid >= best_ask:
-        my_bid = round_tick(best_ask - TICK)
-    if my_ask <= best_bid:
-        my_ask = round_tick(best_bid + TICK)
-
-    # If quotes still cross each other after clamping, skip quoting
-    if my_bid >= my_ask:
-        return None, None, skew, inv_ratio
-
-    return my_bid, my_ask, skew, inv_ratio
-
 # ---------------------------------------------------------------------------
 # Per-ticker state
 # ---------------------------------------------------------------------------
 
 class TickerMM:
     def __init__(self, symbol):
-        self.symbol     = symbol
-        self.bid_oid    = None
-        self.bid_price  = None
-        self.ask_oid    = None
-        self.ask_price  = None
+        self.symbol    = symbol
+        self.bid_oid   = None
+        self.bid_price = None
+        self.ask_oid   = None
+        self.ask_price = None
         self.last_cycle = 0.0
 
     def _get_my_waiting(self, trader):
@@ -177,6 +140,7 @@ class TickerMM:
                 continue
 
             if oid not in waiting:
+                # Filled or cancelled externally
                 log(sim_time, self.symbol, "FILLED", side_label, price, "",
                     "order no longer in waiting list")
                 if side_label == "BID":
@@ -222,17 +186,17 @@ class TickerMM:
                 detail=f"spread={spread:.4f} < {MIN_SPREAD} — waiting")
             return
 
-        # ── Step 5: compute skewed quotes ─────────────────────────────────
-        pos = get_pos(trader, self.symbol)
-        my_bid, my_ask, skew, inv_ratio = compute_skewed_quotes(bid, ask, pos)
+        my_bid = round_tick(bid + TICK)
+        my_ask = round_tick(ask - TICK)
 
-        if my_bid is None:
+        if my_bid >= my_ask:
             log(sim_time, self.symbol, "QUOTE_CROSSED",
-                detail=f"skewed quotes crossed after clamping — skipping "
-                       f"pos={pos:+d}L inv_ratio={inv_ratio:.2f} skew={skew:.4f}")
+                detail=f"my_bid={my_bid} >= my_ask={my_ask} — skipping")
             return
 
-        # ── Step 6: submit missing bid leg ────────────────────────────────
+        pos = get_pos(trader, self.symbol)
+
+        # ── Step 5: submit missing bid leg ────────────────────────────────
         if self.bid_oid is None:
             order = shift.Order(shift.Order.Type.LIMIT_BUY,
                                 self.symbol, QUOTE_LOTS, my_bid)
@@ -241,10 +205,9 @@ class TickerMM:
             self.bid_oid   = order.id
             self.bid_price = my_bid
             log(sim_time, self.symbol, "SUBMIT", "BUY", my_bid, QUOTE_LOTS,
-                f"bid={my_bid} spread={spread:.4f} pos={pos:+d}L "
-                f"inv_ratio={inv_ratio:.2f} skew={skew:.4f}")
+                f"bid+1tick={my_bid} spread={spread:.4f} pos={pos:+d}L")
 
-        # ── Step 7: submit missing ask leg ────────────────────────────────
+        # ── Step 6: submit missing ask leg ────────────────────────────────
         if self.ask_oid is None:
             order = shift.Order(shift.Order.Type.LIMIT_SELL,
                                 self.symbol, QUOTE_LOTS, my_ask)
@@ -253,14 +216,12 @@ class TickerMM:
             self.ask_oid   = order.id
             self.ask_price = my_ask
             log(sim_time, self.symbol, "SUBMIT", "SELL", my_ask, QUOTE_LOTS,
-                f"ask={my_ask} spread={spread:.4f} pos={pos:+d}L "
-                f"inv_ratio={inv_ratio:.2f} skew={skew:.4f}")
+                f"ask-1tick={my_ask} spread={spread:.4f} pos={pos:+d}L")
 
         log(sim_time, self.symbol, "STATUS",
             detail=f"bid={my_bid}({'REST' if self.bid_oid else 'NONE'}) "
                    f"ask={my_ask}({'REST' if self.ask_oid else 'NONE'}) "
-                   f"spread={spread:.4f} pos={pos:+d}L "
-                   f"inv_ratio={inv_ratio:.2f} skew={skew:.4f}")
+                   f"spread={spread:.4f} pos={pos:+d}L")
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +305,7 @@ if __name__ == "__main__":
         trader.connect("initiator.cfg", "aRkkZSrj")
         time.sleep(1.0)
         trader.sub_all_order_book()
-        print("wait 20 sec")
-        time.sleep(20.0)
+        time.sleep(1.0)
         end_time = (trader.get_last_trade_time()
-                    + timedelta(minutes=390.0))
+                    + timedelta(minutes=380.0))
         run(trader, end_time)
