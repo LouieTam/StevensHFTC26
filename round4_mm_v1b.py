@@ -1,5 +1,4 @@
 
-
 import shift
 import time
 import csv
@@ -18,11 +17,14 @@ CYCLE_SECONDS   = 2            # reprice cycle
 POLL_INTERVAL   = 0.2          # inner loop resolution
 PNL_INTERVAL    = 1            # log PnL every N seconds
 
+# Rate limit: exchange allows max 5 cancels/submits per second.
+# Sleep 0.2s after each to stay under the cap.
+RATE_LIMIT_SLEEP = 0.2
+
 # Inventory control
 MAX_POSITION_LOTS = 1000       # hard cap on |position| in lots per ticker
       # multiplier on (inv_ratio * spread). 1.0 = full spread skew at max inv
 
-RATE_LIMIT_SLEEP = 0.2 
 LOG_PATH    = "zi_mm_log_run5.csv"
 PNL_LOG_PATH = "zi_mm_pnl_run5.csv"
 
@@ -117,7 +119,8 @@ def cancel_order(trader, order):
         trader.submit_cancellation(order)
     except Exception as e:
         print(f"[CANCEL ERROR] {e}", flush=True)
-    time.sleep(RATE_LIMIT_SLEEP)   # ← added
+    # Rate limit: <=5 ops/sec → sleep 0.2s after every cancel
+    time.sleep(RATE_LIMIT_SLEEP)
 
 def submit_limit(trader, symbol, side, lots, price, sim_time, detail=""):
     if side == "BUY":
@@ -126,11 +129,12 @@ def submit_limit(trader, symbol, side, lots, price, sim_time, detail=""):
     else:
         order = shift.Order(shift.Order.Type.LIMIT_SELL,
                             symbol, int(lots), float(price))
-
     trader.submit_order(order)
     log(sim_time, symbol, "SUBMIT", side, price, lots, detail)
-    time.sleep(RATE_LIMIT_SLEEP)   # ← added
+    # Rate limit: <=5 ops/sec → sleep 0.2s after every submit
+    time.sleep(RATE_LIMIT_SLEEP)
     return order.id, float(price)
+
 
 def compute_skewed_quotes(best_bid, best_ask, pos_lots):
     """
@@ -263,12 +267,10 @@ class TickerMM:
         if bid_needs_reprice and self.bid_oid is not None:
             self._cancel_leg(trader, "BUY", sim_time,
                              f"reprice bid={bid} ask={ask} skew={skew:+.4f}")
-            time.sleep(0.3)
 
         if ask_needs_reprice and self.ask_oid is not None:
             self._cancel_leg(trader, "SELL", sim_time,
                              f"reprice bid={bid} ask={ask} skew={skew:+.4f}")
-            time.sleep(0.3)
 
         # Refresh best after cancels, recompute skew with fresh state
         bid, ask = get_best(trader, self.symbol)
@@ -413,7 +415,6 @@ def run(trader, end_time):
         for sym in SYMBOLS:
             for o in get_waiting_for(trader, sym):
                 cancel_order(trader, o)
-            time.sleep(0.5)
 
         # Final PnL snapshot before closing
         try:
