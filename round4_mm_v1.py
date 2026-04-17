@@ -11,13 +11,13 @@ SYMBOLS         = ["CS1", "CS2", "CS3"]
 TICK            = 0.01
 LOT_SIZE        = 100
 QUOTE_LOTS      = 3            # lots per side
-MIN_SPREAD      = 0.05         # only quote when spread >= this
+MIN_SPREAD      = 0.04         # only quote when spread >= this
 CYCLE_SECONDS   = 2            # reprice cycle
 POLL_INTERVAL   = 0.2          # inner loop resolution
 PNL_INTERVAL    = 1            # log PnL every N seconds
 
-LOG_PATH    = "zi_mm_log_run4.csv"
-PNL_LOG_PATH = "zi_mm_pnl_run4.csv"
+LOG_PATH    = "zi_mm_log_run5.csv"
+PNL_LOG_PATH = "zi_mm_pnl_run5.csv"
 
 # ---------------------------------------------------------------------------
 # Logging
