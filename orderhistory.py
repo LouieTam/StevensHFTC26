@@ -3,15 +3,15 @@ import time
 import csv
 import os
 
-TICKERS     = ["CS1", "CS2", "CS3"]
+TICKERS     = ["CS1", "CS2"]
 OB_LEVELS   = 10
 SLEEP       = 0.01    # 10ms inner loop
 OB_INTERVAL = 1.0     # record order book every N seconds
 
 def open_writers(ticker):
     """Open trade and order book CSV files for a ticker."""
-    trades_f = open(f"trades1_{ticker}.csv",     mode="w", newline="")
-    ob_f     = open(f"order_book1_{ticker}.csv", mode="w", newline="")
+    trades_f = open(f"tradesRL1_{ticker}.csv",     mode="w", newline="")
+    ob_f     = open(f"order_bookRL1_{ticker}.csv", mode="w", newline="")
 
     trades_w = csv.writer(trades_f)
     ob_w     = csv.writer(ob_f)
