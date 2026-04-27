@@ -4,7 +4,6 @@ import csv
 import os
 from datetime import datetime, timedelta
 from collections import deque
-#ROUND 5
 
 # ---------------------------------------------------------------------------
 # CONFIG

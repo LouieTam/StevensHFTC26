@@ -4,7 +4,6 @@ import csv
 import os
 from datetime import datetime, timedelta
 from collections import deque
-#ROUND 5
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -35,8 +34,8 @@ BOOK_VOL_LEVELS    = 10
 STABILITY_WINDOW   = 15
 STABILITY_BAND     = 50.0
 
-LOG_PATH     = "rl_mm_log_r12.csv"
-PNL_LOG_PATH = "rl_mm_pnl_r12.csv"
+LOG_PATH     = "rl_mm_log_r11.csv"
+PNL_LOG_PATH = "rl_mm_pnl_r11.csv"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -353,59 +352,31 @@ class TickerMM:
         Submit tiered extreme orders when a book side is empty OR thin
         (total volume < THIN_BOOK_LOTS).
 
-        Stage machine per side (0 → 1 → 2 → reset to 0):
-          Stage 0 + needs_extreme : send batch 1, advance to 1
-          Stage 1                 : ALWAYS send batch 2 (complete the sequence
-                                    even if the book has recovered), advance to 2
-          Stage 2                 : reset to 0 at top of next cycle
+        Orders are grouped into batches of exactly 3 to stay within the
+        exchange rate limit of 5 orders/second (arb may fire simultaneously).
+        Each batch is sent on a separate MM cycle (~2 s apart via ext_*_stage).
 
-        Ask side:
-          Batch 1 (4 orders): fixed anchors @400/500/600/700
-          Batch 2 (3 orders): tiered sells near market at +10%/+25%/+50% above bid
+        Ask side (stage 0→1→2):
+          Batch 1:  tier[0],  fixed@400,  fixed@500       ← 3 orders
+          Batch 2:  fixed@600, tier[1],   tier[2]         ← 3 orders
 
-        Bid side:
-          Batch 1 (3 orders): fixed anchors @1/2/3
-          Batch 2 (3 orders): tiered buys near market at -10%/-25%/-50% below ask
+        Bid side (stage 0→1→2):
+          Batch 1:  tier[0],  fixed@1,    fixed@2         ← 3 orders
+          Batch 2:  fixed@3,  tier[1],    tier[2]         ← 3 orders
 
-        Lot sizing for ALL orders (fixed + tiered):
-          pos > 0 (ask side) or pos < 0 (bid side): position-weighted 50/30/20%
-          otherwise: QUOTE_LOTS
+        Stage resets to 0 when the book side recovers above THIN_BOOK_LOTS.
         """
         pos = get_pos(trader, self.symbol)
-        tag = "empty" if ask_vol == 0 else f"thin vol={ask_vol}L"
+        reason_suffix = lambda vol: (
+            "empty" if vol == 0 else f"thin vol={vol}L"
+        )
 
         # ── Ask side ──────────────────────────────────────────────────────────
-        # Reset completed sequence at the very start so the next condition
-        # can immediately re-trigger if the book is still thin.
-        if self.ext_ask_stage == 2:
-            self.ext_ask_stage = 0
-
-        if self.ext_ask_stage == 0 and ask_needs_extreme:
+        if ask_needs_extreme:
             bids, _ = get_book_levels(trader, self.symbol, levels=1)
             ref_bid = (float(bids[0].price)
                        if bids and float(bids[0].price) > 0 else 100.0)
 
-            # Batch 1: fixed far anchors, always QUOTE_LOTS  (4 orders)
-            for px in [400.0, 500.0, 600.0, 700.0]:
-                order = shift.Order(shift.Order.Type.LIMIT_SELL,
-                                    self.symbol, QUOTE_LOTS, px)
-                trader.submit_order(order)
-                log(sim_time, self.symbol, "EXTREME_ASK", "SELL", px, QUOTE_LOTS,
-                    f"ask fixed {tag} batch1 — pos={pos:+d}L")
-            self.ext_ask_stage = 1
-
-        elif self.ext_ask_stage == 1:
-            # Always complete batch 2 regardless of current book state
-            bids, _ = get_book_levels(trader, self.symbol, levels=1)
-            ref_bid = (float(bids[0].price)
-                       if bids and float(bids[0].price) > 0 else 100.0)
-
-            # Percentage-based offsets above bid — always positive
-            tier_prices = [
-                round_tick(ref_bid * 1.10),
-                round_tick(ref_bid * 1.25),
-                round_tick(ref_bid * 1.50),
-            ]
             tier_sizes = (
                 [max(1, round(0.5 * pos)),
                  max(1, round(0.3 * pos)),
@@ -413,49 +384,48 @@ class TickerMM:
                 if pos > 0 else
                 [QUOTE_LOTS, QUOTE_LOTS, QUOTE_LOTS]
             )
+            tier_prices = [
+                round_tick(ref_bid + 50),
+                round_tick(ref_bid + 100),
+                round_tick(ref_bid + 200),
+            ]
+            tag = reason_suffix(ask_vol)
 
-            # Batch 2: tiered sells near market  (3 orders)
-            for px, qty, lbl in zip(tier_prices, tier_sizes,
-                                    ["tier0", "tier1", "tier2"]):
-                order = shift.Order(shift.Order.Type.LIMIT_SELL,
-                                    self.symbol, qty, px)
-                trader.submit_order(order)
-                log(sim_time, self.symbol, "EXTREME_ASK", "SELL", px, qty,
-                    f"ask {lbl} {tag} batch2 — ref_bid={ref_bid} pos={pos:+d}L")
-            self.ext_ask_stage = 2
+            if self.ext_ask_stage == 0:
+                # Batch 1: fixed anchors @400/500/600/700  (4 orders)
+                for px in [400.0, 500.0, 600.0, 700.0]:
+                    order = shift.Order(shift.Order.Type.LIMIT_SELL,
+                                        self.symbol, QUOTE_LOTS, px)
+                    trader.submit_order(order)
+                    log(sim_time, self.symbol, "EXTREME_ASK", "SELL", px, QUOTE_LOTS,
+                        f"ask fixed {tag} batch1 — pos={pos:+d}L")
+                self.ext_ask_stage = 1
+
+            elif self.ext_ask_stage == 1:
+                # Batch 2: tiered prices near market  (3 orders)
+                for px, qty, label in [
+                    (tier_prices[0], tier_sizes[0], f"tier0 {tag}"),
+                    (tier_prices[1], tier_sizes[1], f"tier1 {tag}"),
+                    (tier_prices[2], tier_sizes[2], f"tier2 {tag}"),
+                ]:
+                    order = shift.Order(shift.Order.Type.LIMIT_SELL,
+                                        self.symbol, qty, px)
+                    trader.submit_order(order)
+                    log(sim_time, self.symbol, "EXTREME_ASK", "SELL", px, qty,
+                        f"ask {label} batch2 — ref_bid={ref_bid} pos={pos:+d}L")
+                self.ext_ask_stage = 2
+
+            # stage == 2: nothing more to send this cycle
+
+        else:
+            self.ext_ask_stage = 0      # book has recovered — reset for next time
 
         # ── Bid side ──────────────────────────────────────────────────────────
-        bid_tag = "empty" if bid_vol == 0 else f"thin vol={bid_vol}L"
-
-        if self.ext_bid_stage == 2:
-            self.ext_bid_stage = 0
-
-        if self.ext_bid_stage == 0 and bid_needs_extreme:
+        if bid_needs_extreme:
             _, asks = get_book_levels(trader, self.symbol, levels=1)
             ref_ask = (float(asks[0].price)
                        if asks and float(asks[0].price) > 0 else 100.0)
 
-            # Batch 1: fixed far anchors, always QUOTE_LOTS  (3 orders)
-            for px in [1.0, 2.0, 3.0,4.0]:
-                order = shift.Order(shift.Order.Type.LIMIT_BUY,
-                                    self.symbol, QUOTE_LOTS, px)
-                trader.submit_order(order)
-                log(sim_time, self.symbol, "EXTREME_BID", "BUY", px, QUOTE_LOTS,
-                    f"bid fixed {bid_tag} batch1 — pos={pos:+d}L")
-            self.ext_bid_stage = 1
-
-        elif self.ext_bid_stage == 1:
-            # Always complete batch 2 regardless of current book state
-            _, asks = get_book_levels(trader, self.symbol, levels=1)
-            ref_ask = (float(asks[0].price)
-                       if asks and float(asks[0].price) > 0 else 100.0)
-
-            # Percentage-based offsets below ask — floored at 0.1
-            tier_prices = [
-                max(0.1, round_tick(ref_ask * 0.80)),
-                max(0.1, round_tick(ref_ask * 0.60)),
-                max(0.1, round_tick(ref_ask * 0.50)),
-            ]
             tier_sizes = (
                 [max(1, round(0.5 * abs(pos))),
                  max(1, round(0.3 * abs(pos))),
@@ -463,16 +433,41 @@ class TickerMM:
                 if pos < 0 else
                 [QUOTE_LOTS, QUOTE_LOTS, QUOTE_LOTS]
             )
+            tier_prices = [
+                max(0.1, round_tick(ref_ask - 50)),
+                max(0.1, round_tick(ref_ask - 100)),
+                max(0.1, round_tick(ref_ask - 200)),
+            ]
+            tag = reason_suffix(bid_vol)
 
-            # Batch 2: tiered buys near market  (3 orders)
-            for px, qty, lbl in zip(tier_prices, tier_sizes,
-                                    ["tier0", "tier1", "tier2"]):
-                order = shift.Order(shift.Order.Type.LIMIT_BUY,
-                                    self.symbol, qty, px)
-                trader.submit_order(order)
-                log(sim_time, self.symbol, "EXTREME_BID", "BUY", px, qty,
-                    f"bid {lbl} {bid_tag} batch2 — ref_ask={ref_ask} pos={pos:+d}L")
-            self.ext_bid_stage = 2
+            if self.ext_bid_stage == 0:
+                # Batch 1: fixed anchors @1/2/3  (3 orders)
+                for px in [1.0, 2.0, 3.0]:
+                    order = shift.Order(shift.Order.Type.LIMIT_BUY,
+                                        self.symbol, QUOTE_LOTS, px)
+                    trader.submit_order(order)
+                    log(sim_time, self.symbol, "EXTREME_BID", "BUY", px, QUOTE_LOTS,
+                        f"bid fixed {tag} batch1 — pos={pos:+d}L")
+                self.ext_bid_stage = 1
+
+            elif self.ext_bid_stage == 1:
+                # Batch 2: tiered prices near market  (3 orders)
+                for px, qty, label in [
+                    (tier_prices[0], tier_sizes[0], f"tier0 {tag}"),
+                    (tier_prices[1], tier_sizes[1], f"tier1 {tag}"),
+                    (tier_prices[2], tier_sizes[2], f"tier2 {tag}"),
+                ]:
+                    order = shift.Order(shift.Order.Type.LIMIT_BUY,
+                                        self.symbol, qty, px)
+                    trader.submit_order(order)
+                    log(sim_time, self.symbol, "EXTREME_BID", "BUY", px, qty,
+                        f"bid {label} batch2 — ref_ask={ref_ask} pos={pos:+d}L")
+                self.ext_bid_stage = 2
+
+            # stage == 2: nothing more to send this cycle
+
+        else:
+            self.ext_bid_stage = 0      # book has recovered — reset for next time
 
     def tick(self, trader, sim_time, stab_filter):
         now = time.time()
